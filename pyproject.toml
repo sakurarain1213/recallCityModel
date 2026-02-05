@@ -1,0 +1,16 @@
+[project]
+name = "reranker-train"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pandas",
+    "numpy",
+    "duckdb",
+    "pyarrow",
+    "tqdm",
+    "lightgbm",
+    "scikit-learn",
+    "matplotlib",
+]
