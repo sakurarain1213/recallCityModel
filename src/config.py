@@ -15,9 +15,11 @@ class Config:
     # 训练参数
     SEED = 42
 
-    # 【召回模式】负样本采样率：固定20个困难负样本
-    # 结果：每个Query有 20个正样本(Top1-20) + 20个困难负样本 = 40条数据
-    NEG_SAMPLE_RATE = 20
+    # 【召回模式】负样本采样率：混合采样策略
+    # 策略：30个困难负样本（大城市）+ 30个随机负样本（任意城市）
+    # 结果：每个Query有 20个正样本(Top1-20) + 60个混合负样本 = 80条数据
+    # 目的：解决小城市高分问题，让模型学会区分"距离近但无关"的城市
+    NEG_SAMPLE_RATE = 60
 
     # 数据集划分（21年数据：2000-2020）
     # 2000年仅用于提供历史特征，不参与训练
@@ -36,15 +38,15 @@ class Config:
         'metric': 'binary_logloss',     # 监控 LogLoss
         'boosting_type': 'gbdt',
         'n_estimators': 1000,
-        'learning_rate': 0.05,
+        'learning_rate': 0.1,
 
         # 【优化】增加叶子节点数，让树更深，捕捉复杂关系
         'num_leaves': 63,
 
         'max_depth': -1,
 
-        # 【修复】从 10 改为 500，对于千万级数据，叶子节点至少要有几百个样本才具有统计意义
-        'min_child_samples': 500,
+        # 【修复】从 10 改为 100，对于千万级数据，叶子节点至少要有几百个样本才具有统计意义
+        'min_child_samples': 100,
 
         'subsample': 0.8,
 
@@ -52,49 +54,60 @@ class Config:
         'colsample_bytree': 0.8,
 
         # 【优化】增加 L1/L2 正则化，防止过拟合单一特征
-        'lambda_l1': 0.1,
-        'lambda_l2': 0.1,
+        'lambda_l1': 0.5,
+        'lambda_l2': 0.5,
 
         # 【新增】增加 Hessian 阈值，防止在弱信号上强行分裂
-        'min_sum_hessian_in_leaf': 1.0,
+        'min_sum_hessian_in_leaf': 0.001,
 
         'random_state': 42,
         'n_jobs': -1,
         'verbosity': -1,  # 减少警告输出
     }
 
-    # GPU 训练参数（需要安装 lightgbm-gpu 版本）
+    # 第二套！  GPU 训练参数（需要安装 lightgbm-gpu 版本）
     LGBM_PARAMS_GPU = {
-        'objective': 'binary',          # 改为二分类
-        'metric': 'binary_logloss',     # 监控 LogLoss
+        'objective': 'binary',
+        'metric': 'binary_logloss',
         'boosting_type': 'gbdt',
 
-        # 1. 降低学习率，增加树，让学习过程更平滑
-        'n_estimators': 2000,   # 原 1000 -> 2000
-        'learning_rate': 0.03,  # 原 0.05 -> 0.03
+        # 基础参数
+        'n_estimators': 3000,
+        'learning_rate': 0.1,
+        'random_state': 42,
+        'verbosity': 1,
 
-        # GPU 特定参数
+        # GPU 特定配置
         'device': 'gpu',
         'gpu_platform_id': 0,
         'gpu_device_id': 0,
 
-        # 树结构参数
-        'num_leaves': 63,
-        'max_depth': -1,        # 不限制深度
+        # 【核心修复 1】开启双精度 (Double Precision)
+        # 单精度(False)会导致直方图计算误差，引发 left_count > 0 崩溃
+        # 虽然会慢一点点，但这是 RTX 显卡跑 OpenCL 的唯一稳定解
+        'gpu_use_dp': True,
 
-        # 【关键】增加叶子节点所需样本数，防止过拟合
-        'min_child_samples': 800,  # 原 500 -> 800
+        # 【核心修复 2】降低直方图箱数 (Max Bin)
+        # 默认 255 在 GPU 上容易出现空箱子，降到 63 可以显著提升稳定性
+        'max_bin': 63,
 
-        # 【关键】降低采样率，强迫模型使用更多样化的特征
-        'subsample': 0.7,           # 原 0.8 -> 0.7
-        'colsample_bytree': 0.6,    # 原 0.8 -> 0.6
+        # 树结构参数 (保守设置)
+        'num_leaves': 31,       # 保持适中
+        'max_depth': -1,        # 让 num_leaves 控制
+        'min_child_samples': 50,# 恢复到 50，20 太敏感，1000 太难满足
+        'min_child_weight': 0.001,
 
-        # 【关键】增加正则化，防止过拟合单一特征
-        'lambda_l1': 1.0,       # 原 0.1 -> 1.0
-        'lambda_l2': 1.0,       # 原 0.1 -> 1.0
+        # 采样与特征
+        'subsample': 0.8,
+        'subsample_freq': 1,
+        'colsample_bytree': 0.8, # 每次只用 80% 特征
 
-        'min_sum_hessian_in_leaf': 1.0,
+        # 正则化 (适度)
+        'lambda_l1': 2.0,
+        'lambda_l2': 2.0,
+        'min_gain_to_split': 0.0,
+        'min_sum_hessian_in_leaf': 0.001,
 
-        'random_state': 42,
-        'verbosity': -1,
+        # 强制列式直方图 (通常更稳)
+        'force_col_wise': True,
     }

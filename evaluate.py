@@ -109,7 +109,7 @@ def load_model_fast(model_path):
     
     if ctx.model is None:
         model_path = Path(model_path)
-        feature_path = model_path.parent.parent / 'feature_cols.pkl'
+        feature_path = model_path.parent / 'feature_cols.pkl'
         
         ctx.model = lgb.Booster(model_file=str(model_path))
         with open(feature_path, 'rb') as f:
@@ -234,8 +234,9 @@ def fast_batch_predict(df_queries, year, ctx):
 
 def calculate_metrics_fast(candidates, df_pos):
     """
-    向量化计算 Recall@10 (极速版)
+    向量化计算 Recall, Normalized Hits 等指标 (极速版)
     完全移除 for 循环，利用 pandas merge 进行集合运算
+    一次性计算 @5, @10, @20
     """
     print("     [Metrics] 正在进行向量化评估...")
 
@@ -252,51 +253,64 @@ def calculate_metrics_fast(candidates, df_pos):
     true_df['To_City'] = true_df['To_City'].astype('int16')
 
     # 只保留需要的列：Key(Year, Type, From) + Target(To_City)
-    # 这一步顺便过滤掉了不在本次评估范围内的 Query (通过 merge 控制)
     truth_set = true_df[['Year', 'Type_ID', 'From_City', 'To_City']].drop_duplicates()
 
-    # 2. 提取预测结果的 Top 10
+    # 计算每个 Query 的真实正样本数 (Total True)
+    # 限制 Truth 范围在当前的评估集内
+    unique_queries = candidates[['Year', 'Type_ID', 'From_City']].drop_duplicates()
+    relevant_truth = pd.merge(truth_set, unique_queries, on=['Year', 'Type_ID', 'From_City'], how='inner')
+    truth_counts = relevant_truth.groupby(['Year', 'Type_ID', 'From_City']).size().reset_index(name='total_true')
+
+    # 2. 提取预测 Top 20
     # 先按分数降序排列
     candidates = candidates.sort_values(
         by=['Year', 'Type_ID', 'From_City', 'pred_score'],
         ascending=[True, True, True, False]
     )
 
-    # 每个 Query 取前 10 个 (GroupBy Head 是高度优化的)
-    top10_preds = candidates.groupby(['Year', 'Type_ID', 'From_City']).head(10)
+    # 计算排名 (1-based)
+    candidates['rank'] = candidates.groupby(['Year', 'Type_ID', 'From_City']).cumcount() + 1
+    
+    # 截取 Top 20 用于计算
+    top20_preds = candidates[candidates['rank'] <= 20].copy()
 
     # 3. 计算命中数 (Hits)
-    # 通过 Inner Merge 找出既在 Top10 预测中，又在 Truth 中的记录
-    # on 的列包含了 Query ID 和 To_City，只有完全匹配才算命中
+    # 通过 Inner Merge 找出既在 Top20 预测中，又在 Truth 中的记录
     hits = pd.merge(
-        top10_preds,
+        top20_preds,
         truth_set,
         on=['Year', 'Type_ID', 'From_City', 'To_City'],
         how='inner'
     )
 
-    # 统计每个 Query 命中了多少个
-    hit_counts = hits.groupby(['Year', 'Type_ID', 'From_City']).size().reset_index(name='hit_count')
+    # 统计不同 K 下的命中数
+    hits['hit_5'] = (hits['rank'] <= 5).astype(int)
+    hits['hit_10'] = (hits['rank'] <= 10).astype(int)
+    hits['hit_20'] = (hits['rank'] <= 20).astype(int)
 
-    # 4. 计算每个 Query 的真实正样本总数 (分母)
-    # 这里的关键是：只计算我们在 candidates 里有的那些 Query 的分母
-    unique_queries = candidates[['Year', 'Type_ID', 'From_City']].drop_duplicates()
+    # 聚合每个 Query 的 Hit 数
+    hits_metrics = hits.groupby(['Year', 'Type_ID', 'From_City'])[['hit_5', 'hit_10', 'hit_20']].sum().reset_index()
 
-    # 限制 Truth 范围在当前的评估集内
-    relevant_truth = pd.merge(truth_set, unique_queries, on=['Year', 'Type_ID', 'From_City'], how='inner')
-    truth_counts = relevant_truth.groupby(['Year', 'Type_ID', 'From_City']).size().reset_index(name='total_true')
-
-    # 5. 合并分子分母计算 Recall
-    results_df = pd.merge(truth_counts, hit_counts, on=['Year', 'Type_ID', 'From_City'], how='left')
+    # 4. 合并分母和分子
+    results_df = pd.merge(truth_counts, hits_metrics, on=['Year', 'Type_ID', 'From_City'], how='left')
 
     # 没命中的填 0
-    results_df['hit_count'] = results_df['hit_count'].fillna(0)
+    results_df[['hit_5', 'hit_10', 'hit_20']] = results_df[['hit_5', 'hit_10', 'hit_20']].fillna(0)
 
-    # 计算 Recall
-    results_df['recall_10'] = results_df['hit_count'] / results_df['total_true']
+    # 5. 计算指标
+    # 防止除零异常 (理论上 total_true >= 1)
+    results_df['total_true'] = results_df['total_true'].replace(0, 1)
 
-    # 处理可能的除零异常 (理论上 total_true >= 1)
-    results_df['recall_10'] = results_df['recall_10'].fillna(0.0)
+    # 标准 Recall (Hits / Total True)
+    results_df['recall_5'] = results_df['hit_5'] / results_df['total_true']
+    results_df['recall_10'] = results_df['hit_10'] / results_df['total_true']
+    results_df['recall_20'] = results_df['hit_20'] / results_df['total_true']
+
+    # 归一化命中率 (Hits / min(Total True, K))
+    # 解决了"由于正样本过多导致 Recall 虚低"的问题
+    results_df['norm_hit_5'] = results_df['hit_5'] / np.minimum(results_df['total_true'], 5)
+    results_df['norm_hit_10'] = results_df['hit_10'] / np.minimum(results_df['total_true'], 10)
+    results_df['norm_hit_20'] = results_df['hit_20'] / np.minimum(results_df['total_true'], 20)
 
     return results_df
 
@@ -340,8 +354,21 @@ def evaluate_fast(model_path, year, sample_size=10):
     print("\n" + "="*40)
     print(f"快速评估结果 ({year})")
     print("="*40)
-    print(f"查询数量: {len(metrics)}")
-    print(f"Recall@10: {metrics['recall_10'].mean():.4f}")
+    print(f"查询数量 (Queries): {len(metrics)}")
+    print(f"平均正样本数 (Avg GT Size): {metrics['total_true'].mean():.2f}")
+    
+    print("-" * 30)
+    print("Standard Recall (Hits / Total_True):")
+    print(f"  Recall@5 : {metrics['recall_5'].mean():.4f}")
+    print(f"  Recall@10: {metrics['recall_10'].mean():.4f}")
+    print(f"  Recall@20: {metrics['recall_20'].mean():.4f}")
+    
+    print("-" * 30)
+    print("Normalized Hits (Hits / min(Total, K)):")
+    print("  (解决了正样本 > K 时 Recall 虚低的问题)")
+    print(f"  Norm@5   : {metrics['norm_hit_5'].mean():.4f}")
+    print(f"  Norm@10  : {metrics['norm_hit_10'].mean():.4f}")
+    print(f"  Norm@20  : {metrics['norm_hit_20'].mean():.4f}")
 
     return metrics
 
@@ -377,22 +404,17 @@ def predict_one(year, type_id, from_city, model_path):
     return top10[['To_City', 'pred_score']].values.tolist()
 
 if __name__ == "__main__":
-    MODEL_PATH = r"C:\Users\w1625\Desktop\reranker-train\output\models\checkpoints\model_batch_3_years_2008-2004.txt"
+    MODEL_PATH = r"C:\Users\w1625\Desktop\reranker-train\output\models\binary_model.txt"
 
     '''
-    \model_batch_1_years_2001-2003.txt
-    \model_batch_2_years_2004-2006.txt
-    \model_batch_3_years_2007-2009.txt
-    \model_batch_4_years_2010-2012.txt
-    \model_batch_5_years_2013-2015.txt
-    \model_batch_6_years_2016-2017.txt
+output\models\binary_model.txt
     '''
 
     # 1. 采样评估
     print("\n" + "="*80)
     print("开始采样评估...")
     print("="*80)
-    evaluate_fast(MODEL_PATH, 2019, sample_size=100000)
+    evaluate_fast(MODEL_PATH, 2020, sample_size=100000)
 
     # 2. 快速推理示例
     print("\n" + "="*80)
@@ -401,7 +423,7 @@ if __name__ == "__main__":
     import time
     t0 = time.time()
 
-    top10 = predict_one(2019, 'F_20_EduHi_Agri_IncH_Split', 1100, MODEL_PATH)
+    top10 = predict_one(2020, 'F_20_EduHi_Service_IncH_Split', 3301, MODEL_PATH)
 
     t1 = time.time()
     print(f"\n推理时间: {(t1-t0)*1000:.2f} ms")

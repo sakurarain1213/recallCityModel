@@ -39,20 +39,20 @@ def load_raw_data_from_duckdb(db_path, year_filter=None):
 
 def create_long_format_with_negatives(df_wide, all_city_ids, hard_candidates, neg_sample_rate=20, is_test_set=False):
     """
-    将宽表转换为长表格式，并添加困难负样本（二分类模式 + 软标签）
+    将宽表转换为长表格式，并添加混合负样本（二分类模式 + 软标签）
 
     软标签策略：
     1. Top 1-10：Label = 1.0（绝对正样本）
     2. Top 11-20：Label = 0.1（灰度样本，比负样本强但不如 Top 10）
-    3. 困难负样本：Label = 0.0（纯负样本）
-
-    这样可以避免标签噪声，让模型学到更平滑的特征梯度。
+    3. 混合负样本：Label = 0.0（纯负样本）
+       - 一半困难负样本（来自 hard_candidates，大城市）
+       - 一半随机负样本（来自 all_city_ids，任意城市，用于纠正偏差）
 
     Args:
         df_wide: 宽表格式的数据
-        all_city_ids: 所有可能的目标城市列表（保留用于兼容性，实际不使用）
+        all_city_ids: 所有可能的目标城市列表（用于随机负采样）
         hard_candidates: 困难负样本候选池（省会+一二线城市的ID列表）
-        neg_sample_rate: 负采样数量（固定20）
+        neg_sample_rate: 负采样数量（默认20，建议设置为60）
         is_test_set: 是否是测试集（保留用于兼容性）
     """
     # 1. 定义 ID 列
@@ -117,37 +117,55 @@ def create_long_format_with_negatives(df_wide, all_city_ids, hard_candidates, ne
     df_pos['To_City'] = df_pos['To_City'].astype('int16')
 
     # ==========================================
-    # B. 构建困难负样本（只使用困难负样本）
+    # B. 构建混合负样本 (Mixed Negative Sampling)
     # ==========================================
     df_base = df_wide[id_cols].copy()
     n_queries = len(df_base)
-    n_neg = neg_sample_rate  # 固定20个
 
-    # 从困难候选池中随机抽样
-    if hard_candidates is not None and len(hard_candidates) > 0:
+    # 策略配置：一半困难，一半随机
+    # 如果你想加强随机覆盖，可以把总数调大，例如 neg_sample_rate 传 60
+    n_hard = int(neg_sample_rate * 0.5)
+    n_rand = neg_sample_rate - n_hard
+
+    neg_dfs = []
+
+    # --- 1. 困难负样本 ---
+    if hard_candidates is not None and n_hard > 0:
         hard_pool = np.array(hard_candidates)
-        chosen_neg_cities = np.random.choice(hard_pool, size=n_queries * n_neg)
+        # 随机抽取
+        chosen_hard = np.random.choice(hard_pool, size=n_queries * n_hard)
+
+        df_hard = df_base.loc[df_base.index.repeat(n_hard)].reset_index(drop=True)
+        df_hard['To_City'] = chosen_hard.astype(str)
+        neg_dfs.append(df_hard)
+
+    # --- 2. 随机负样本 (关键修复：解决小城市高分问题) ---
+    if all_city_ids is not None and n_rand > 0:
+        all_pool = np.array(all_city_ids)  # 确保是列表或数组
+        chosen_rand = np.random.choice(all_pool, size=n_queries * n_rand)
+
+        df_rand = df_base.loc[df_base.index.repeat(n_rand)].reset_index(drop=True)
+        df_rand['To_City'] = chosen_rand.astype(str)
+        neg_dfs.append(df_rand)
+
+    # 合并所有负样本
+    if neg_dfs:
+        df_neg = pd.concat(neg_dfs, axis=0, ignore_index=True)
+
+        # 统一处理
+        df_neg['To_City'] = df_neg['To_City'].astype('int16')  # 假设全量ID已经是int兼容
+        # 排除 To == From
+        df_neg['From_City_Int'] = df_neg['From_City'].apply(extract_city_id).astype('int16')
+        df_neg = df_neg[df_neg['To_City'] != df_neg['From_City_Int']]
+        df_neg = df_neg.drop(columns=['From_City_Int'])
+
+        # 打标
+        df_neg['Flow_Count'] = 0
+        df_neg['Rank'] = 999
+        df_neg['Label'] = 0.0
+        df_neg['Label'] = df_neg['Label'].astype('float32')
     else:
-        # 如果没有提供困难候选池，报错（召回模式必须有困难负样本）
-        raise ValueError("召回模式必须提供 hard_candidates（困难负样本候选池）")
-
-    # 构造负样本
-    df_neg = df_base.loc[df_base.index.repeat(n_neg)].reset_index(drop=True)
-    df_neg['To_City'] = chosen_neg_cities.astype(str)
-
-    # 转换为 int16
-    df_neg['To_City'] = df_neg['To_City'].astype('int16')
-    df_neg['From_City_Int'] = df_neg['From_City'].apply(extract_city_id).astype('int16')
-
-    # 排除 To_City == From_City
-    df_neg = df_neg[df_neg['To_City'] != df_neg['From_City_Int']]
-    df_neg = df_neg.drop(columns=['From_City_Int'])
-
-    # 添加标签
-    df_neg['Flow_Count'] = 0
-    df_neg['Rank'] = 999
-    df_neg['Label'] = 0.0  # 纯负样本
-    df_neg['Label'] = df_neg['Label'].astype('float32')
+        raise ValueError("没有生成任何负样本，请检查输入")
 
     # ==========================================
     # C. 合并与去重

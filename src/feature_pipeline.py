@@ -119,7 +119,19 @@ class FeaturePipeline:
             print(f"[4/4] Optimizing data types...")
         df = optimize_dtypes(df)
 
-        # 【步骤7】保留中间列用于历史特征匹配
+        # 【步骤7】特征分离 (Feature Decoupling)
+        # 如果是生成训练数据，删掉静态特征以节省空间
+        # 静态特征列表 (必须与 static_city_pairs.parquet 一致)
+        static_cols = ['geo_distance', 'dialect_distance'] + [c for c in df.columns if c.endswith('_ratio')]
+
+        if mode == 'train':
+            # 检查这些列是否存在，存在则删除
+            cols_to_drop = [c for c in static_cols if c in df.columns]
+            if verbose and cols_to_drop:
+                print(f"  [Decoupling] Dropping {len(cols_to_drop)} static features to save disk space...")
+            df = df.drop(columns=cols_to_drop)
+
+        # 【步骤8】保留中间列用于历史特征匹配
         # 注意：Type_ID_orig 和 From_City_orig 需要保留在保存的数据中
         # 因为后续年份会读取这些数据来构建历史特征
         # 只在训练/预测时才删除这些列（通过 get_feature_columns 方法）

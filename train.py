@@ -16,6 +16,23 @@ from src.config import Config
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei']
 plt.rcParams['axes.unicode_minus'] = False
 
+# 全局加载一次静态特征 (避免在循环中反复读取)
+STATIC_FEATURES = None
+
+
+def load_static_features():
+    """加载静态特征（城市对之间的距离、属性比值等）"""
+    global STATIC_FEATURES
+    if STATIC_FEATURES is None:
+        path = Path(Config.OUTPUT_DIR) / 'static_city_pairs.parquet'
+        print(f"Loading static features from {path}...")
+        STATIC_FEATURES = pd.read_parquet(path)
+        # 确保类型一致
+        STATIC_FEATURES['From_City'] = STATIC_FEATURES['From_City'].astype('int16')
+        STATIC_FEATURES['To_City'] = STATIC_FEATURES['To_City'].astype('int16')
+        print(f"  Static features loaded: {STATIC_FEATURES.shape}")
+    return STATIC_FEATURES
+
 
 def parse_year_config(end_year=None):
     """
@@ -78,8 +95,82 @@ def load_processed_data(years, data_dir='output/processed_data'):
             gc.collect()
 
 
-def prepare_features(df):
-    """准备特征和标签"""
+def prepare_features(df, is_training_data=True):
+    """准备特征和标签
+
+    Args:
+        df: 输入 DataFrame
+        is_training_data: 是否是训练数据（如果是，需要 merge 静态特征）
+    """
+    # 如果是训练数据加载进来的，可能缺少静态特征，需要 Merge
+    if is_training_data:
+        static_df = load_static_features()
+
+        # 检查是否已经有静态特征 (防止重复 Merge)
+        if 'geo_distance' not in df.columns:
+            # print("  Merging static features on-the-fly...")
+
+            # 【调试代码】打印 merge 前的形状
+            # print(f"    Pre-merge shape: {df.shape}")
+
+            # 【关键修复】确保 From_City 和 To_City 是 int16 类型
+            # From_City 格式: "110000_北京市" -> 提取前4位 -> 1100
+            # To_City 已经是 int16 类型（在 data_loader 中已处理）
+
+            if df['From_City'].dtype == 'object':
+                # 提取城市ID：从 "北京(1100)" 或 "110000_北京市" 中提取城市编号
+                def extract_4digit_city_id(val):
+                    if pd.isna(val):
+                        return None
+                    val_str = str(val).strip()
+
+                    # 格式1: "北京(1100)" - 提取括号内的数字
+                    if '(' in val_str and ')' in val_str:
+                        import re
+                        match = re.search(r'\((\d+)\)', val_str)
+                        if match:
+                            return int(match.group(1))
+
+                    # 格式2: "110000_北京市" - 取下划线前的部分，然后取前4位
+                    if '_' in val_str:
+                        city_code = val_str.split('_')[0]
+                        if len(city_code) >= 4:
+                            return int(city_code[:4])
+
+                    # 格式3: 纯数字字符串
+                    if val_str.isdigit():
+                        if len(val_str) >= 4:
+                            return int(val_str[:4])
+                        return int(val_str)
+
+                    return None
+
+                df['From_City'] = df['From_City'].apply(extract_4digit_city_id).astype('int16')
+
+            # 确保 To_City 也是 int16
+            if df['To_City'].dtype != 'int16':
+                df['To_City'] = df['To_City'].astype('int16')
+
+            # Left Merge
+            df = df.merge(static_df, on=['From_City', 'To_City'], how='left')
+
+            # 【必须添加的保命检查】检查 Merge 是否成功！
+            if 'geo_distance' in df.columns:
+                nan_count = df['geo_distance'].isna().sum()
+                if nan_count > 0:
+                    print(f"🚨 [严重警告] 发现 {nan_count} 行 ({nan_count/len(df):.2%}) 静态特征为 NaN！")
+                    print("   这会导致 GPU 训练崩溃。正在填充默认值...")
+
+                    # 填充 NaN，防止 GPU 遇到空值不知所措
+                    fill_val = -1.0
+                    fill_cols = [c for c in static_df.columns if c not in ['From_City', 'To_City']]
+                    for col in fill_cols:
+                        if col in df.columns:
+                            df[col] = df[col].fillna(fill_val)
+                    print(f"   已将所有 NaN 填充为 {fill_val}")
+            else:
+                print("⚠️ 警告: geo_distance 列不存在，可能 merge 失败！")
+
     # 排除的列 - 移除泄露特征、ID列和辅助列
     exclude_cols = [
         'Label',        # 标签
@@ -101,6 +192,28 @@ def prepare_features(df):
 
     X = df[feature_cols]
     y = df['Label']
+
+    # 【关键调试】检查数据质量
+    # 检查 NaN
+    nan_cols = X.columns[X.isna().any()].tolist()
+    if nan_cols:
+        print(f"⚠️ 警告: 以下特征包含 NaN 值: {nan_cols}")
+        print(f"   将 NaN 填充为 -999")
+        X = X.fillna(-999)
+
+    # 检查 Inf
+    inf_mask = np.isinf(X.select_dtypes(include=[np.number]).values).any(axis=0)
+    if inf_mask.any():
+        inf_cols = X.select_dtypes(include=[np.number]).columns[inf_mask].tolist()
+        print(f"⚠️ 警告: 以下特征包含 Inf 值: {inf_cols}")
+        print(f"   将 Inf 替换为 -999")
+        X = X.replace([np.inf, -np.inf], -999)
+
+    # 检查标签分布
+    label_dist = y.value_counts().sort_index()
+    print(f"\n标签分布:")
+    for label, count in label_dist.items():
+        print(f"  Label {label}: {count:,} ({count/len(y)*100:.2f}%)")
 
     return X, y, feature_cols
 
@@ -146,6 +259,9 @@ def train_model(train_years=None, val_years=None, use_gpu=False):
         print("🚀 GPU 训练模式已启用")
     print("="*60)
 
+    # 预加载静态特征（全局加载一次，避免重复读取）
+    load_static_features()
+
     # 分批策略：每3年一批，避免内存溢出同时保证学习效果
     # === 修改后 ===
     import random
@@ -166,7 +282,7 @@ def train_model(train_years=None, val_years=None, use_gpu=False):
     print(f"\nLoading first batch to extract feature columns...")
     first_year_file = Path('output/processed_data') / f"processed_{train_years[0]}.parquet"
     first_df = pd.read_parquet(first_year_file)
-    _, _, feature_cols = prepare_features(first_df)
+    _, _, feature_cols = prepare_features(first_df, is_training_data=True)
     print(f"Features: {len(feature_cols)}")
     del first_df
     gc.collect()
@@ -179,7 +295,7 @@ def train_model(train_years=None, val_years=None, use_gpu=False):
     val_df = pd.read_parquet(val_file)
     print(f"Validation data: {len(val_df):,} rows")
 
-    X_val, y_val, _ = prepare_features(val_df)
+    X_val, y_val, _ = prepare_features(val_df, is_training_data=True)
 
     del val_df
     gc.collect()
@@ -230,8 +346,8 @@ def train_model(train_years=None, val_years=None, use_gpu=False):
         del batch_dfs
         gc.collect()
 
-        # 准备特征
-        X_train, y_train, _ = prepare_features(batch_df)
+        # 准备特征（这里触发 On-the-fly Merge）
+        X_train, y_train, _ = prepare_features(batch_df, is_training_data=True)
 
         del batch_df
         gc.collect()

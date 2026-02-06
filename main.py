@@ -82,8 +82,8 @@ def process_single_year(year, city_data_loader, pipeline, output_dir, hard_candi
 
     print(f"[{year}] Loaded {len(df_wide):,} records")
 
-    # 2. Wide to Long 转换（召回模式：20正样本 + 20困难负样本）
-    print(f"[{year}] Step 2/4: Converting to long format (Recall Mode: 20 Pos + 20 Hard Neg)...")
+    # 2. Wide to Long 转换（召回模式：20正样本 + 60混合负样本）
+    print(f"[{year}] Step 2/4: Converting to long format (Recall Mode: 20 Pos + 60 Mixed Neg)...")
     df_long = create_long_format_with_negatives(
         df_wide,
         city_data_loader.get_city_ids(),
@@ -94,7 +94,7 @@ def process_single_year(year, city_data_loader, pipeline, output_dir, hard_candi
 
     del df_wide
     gc.collect()
-    print(f"[{year}] Generated {len(df_long):,} samples (20 pos + 20 hard neg per query)")
+    print(f"[{year}] Generated {len(df_long):,} samples (20 pos + 60 mixed neg per query)")
 
     # 3. 创建查询组ID（在特征工程之前）
     print(f"[{year}] Step 3/4: Creating query groups...")
