@@ -414,7 +414,11 @@ output\models\binary_model.txt
     print("\n" + "="*80)
     print("开始采样评估...")
     print("="*80)
-    evaluate_fast(MODEL_PATH, 2020, sample_size=100000)
+    evaluate_fast(MODEL_PATH, 2019, sample_size=100000)
+
+
+
+
 
     # 2. 快速推理示例
     print("\n" + "="*80)
