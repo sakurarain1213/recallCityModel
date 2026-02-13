@@ -10,78 +10,110 @@ from pathlib import Path
 class CityDataLoader:
     """城市数据加载器"""
 
-    def __init__(self, data_dir='data'):
+    def __init__(self, data_dir='C:/Users/w1625/Desktop/recall/data'):
         self.data_dir = Path(data_dir)
-        self.city_info = None
+        self.city_info_dir = self.data_dir / 'cities_2000-2020'  # 年度城市信息目录
+        self.city_info = {}  # 改为字典,按年份存储: {year: DataFrame}
         self.city_edges = None
         self.city_nodes = None
         self.city_ids = None
 
-    def load_all(self):
-        """加载所有城市数据"""
-        self.load_city_info()
+    def load_all(self, year=None):
+        """
+        加载所有城市数据
+
+        Args:
+            year: 指定年份的城市数据,如果为None则加载所有年份
+        """
+        self.load_city_info(year)
         self.load_city_edges()
         self.load_city_nodes()
         return self
 
-    def load_city_info(self):
+    def load_city_info(self, year=None):
         """
-        加载城市详细信息（静态属性）
-        包括：坐标、产业结构、经济指标、人口结构等
+        加载城市详细信息(年度动态属性)
+
+        Args:
+            year: 指定年份(2000-2020),如果为None则加载所有年份
+                  数据目录: data/cities_2000-2020/cities_{year}.jsonl
         """
-        print("Loading city info from cities_data.jsonl...")
-        city_info_path = self.data_dir / 'cities_data.jsonl'
+        # 确定要加载的年份
+        if year is not None:
+            years_to_load = [year]
+            print(f"Loading city info for year {year}...")
+        else:
+            # 加载所有年份(2000-2020)
+            years_to_load = range(2000, 2021)
+            print("Loading city info for all years (2000-2020)...")
 
-        if not city_info_path.exists():
-            print(f"Warning: {city_info_path} not found, using empty data")
-            self.city_info = pd.DataFrame()
-            return self
+        # 加载指定年份的数据
+        for yr in years_to_load:
+            city_info_path = self.city_info_dir / f'cities_{yr}.jsonl'
 
-        data = []
-        with open(city_info_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                data.append(json.loads(line))
+            if not city_info_path.exists():
+                print(f"Warning: {city_info_path} not found, skipping year {yr}")
+                continue
 
-        # 展平嵌套的 JSON 结构
-        flattened_data = []
-        for item in data:
-            flat_item = {
-                'city_id': item['city_id'],
-                'city_name': item['city_name'],
-                # 基本信息
-                'tier': item['basic_info']['tier'],
-                'area_sqkm': item['basic_info']['area_sqkm'],
-                # 经济指标
-                'gdp_per_capita': item['economy']['gdp_per_capita'],
-                'cpi_index': item['economy']['cpi_index'],
-                'unemployment_rate': item['economy']['unemployment_rate'],
-                # 产业结构
-                'agriculture_share': item['economy']['industry_sectors']['agriculture']['share'],
-                'agriculture_wage': item['economy']['industry_sectors']['agriculture']['avg_wage'],
-                'manufacturing_share': item['economy']['industry_sectors']['manufacturing']['share'],
-                'manufacturing_wage': item['economy']['industry_sectors']['manufacturing']['avg_wage'],
-                'traditional_services_share': item['economy']['industry_sectors']['traditional_services']['share'],
-                'traditional_services_wage': item['economy']['industry_sectors']['traditional_services']['avg_wage'],
-                'modern_services_share': item['economy']['industry_sectors']['modern_services']['share'],
-                'modern_services_wage': item['economy']['industry_sectors']['modern_services']['avg_wage'],
-                # 生活成本
-                'housing_price_avg': item['living_cost']['housing_price_avg'],
-                'rent_avg': item['living_cost']['rent_avg'],
-                'daily_cost_index': item['living_cost']['daily_cost_index'],
-                # 公共服务
-                'medical_score': item['public_services']['medical_score'],
-                'education_score': item['public_services']['education_score'],
-                'transport_convenience': item['public_services']['transport_convenience'],
-                'avg_commute_mins': item['public_services']['avg_commute_mins'],
-                # 人口
-                'population_total': item['social_context']['population_total'],
-            }
-            flattened_data.append(flat_item)
+            data = []
+            with open(city_info_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    data.append(json.loads(line))
 
-        self.city_info = pd.DataFrame(flattened_data)
-        self.city_info.set_index('city_id', inplace=True)
-        print(f"Loaded {len(self.city_info)} cities info")
+            # 展平嵌套的 JSON 结构
+            flattened_data = []
+            for item in data:
+                flat_item = {
+                    'city_id': item['city_id'],
+                    'city_name': item['city_name'],
+                    # 基本信息
+                    'tier': item['basic_info']['tier'],
+                    'area_sqkm': item['basic_info']['area_sqkm'],
+                    # 经济指标
+                    'gdp_per_capita': item['economy']['gdp_per_capita'],
+                    'cpi_index': item['economy']['cpi_index'],
+                    'unemployment_rate': item['economy']['unemployment_rate'],
+                    # 产业结构
+                    'agriculture_share': item['economy']['industry_sectors']['agriculture']['share'],
+                    'agriculture_wage': item['economy']['industry_sectors']['agriculture']['avg_wage'],
+                    'manufacturing_share': item['economy']['industry_sectors']['manufacturing']['share'],
+                    'manufacturing_wage': item['economy']['industry_sectors']['manufacturing']['avg_wage'],
+                    'traditional_services_share': item['economy']['industry_sectors']['traditional_services']['share'],
+                    'traditional_services_wage': item['economy']['industry_sectors']['traditional_services']['avg_wage'],
+                    'modern_services_share': item['economy']['industry_sectors']['modern_services']['share'],
+                    'modern_services_wage': item['economy']['industry_sectors']['modern_services']['avg_wage'],
+                    # 生活成本
+                    'housing_price_avg': item['living_cost']['housing_price_avg'],
+                    'rent_avg': item['living_cost']['rent_avg'],
+                    'daily_cost_index': item['living_cost']['daily_cost_index'],
+                    # 公共服务
+                    'medical_score': item['public_services']['medical_score'],
+                    'education_score': item['public_services']['education_score'],
+                    'transport_convenience': item['public_services']['transport_convenience'],
+                    'avg_commute_mins': item['public_services']['avg_commute_mins'],
+                    # 人口
+                    'population_total': item['social_context']['population_total'],
+                }
+                flattened_data.append(flat_item)
+
+            df = pd.DataFrame(flattened_data)
+            df.set_index('city_id', inplace=True)
+            self.city_info[yr] = df
+            print(f"Loaded {len(df)} cities info for year {yr}")
+
         return self
+
+    def get_city_info_for_year(self, year):
+        """
+        获取指定年份的城市信息DataFrame
+
+        Args:
+            year: 年份(2000-2020)
+
+        Returns:
+            DataFrame or None(如果该年份数据不存在)
+        """
+        return self.city_info.get(year)
 
     def load_city_edges(self):
         """
@@ -173,15 +205,34 @@ class CityDataLoader:
 
         return edge.iloc[0]['w_geo'], edge.iloc[0]['w_dialect']
 
-    def get_city_attributes(self, city_id):
+    def get_city_attributes(self, city_id, year=None):
         """
         获取城市的所有属性
-        返回: dict 或 None
+
+        Args:
+            city_id: 城市ID
+            year: 年份(2000-2020),如果为None则返回2010年的数据作为默认
+
+        Returns:
+            dict 或 None
         """
-        if self.city_info is None or self.city_info.empty:
+        # 默认使用2010年数据
+        if year is None:
+            year = 2010
+
+        # 获取该年份的城市信息
+        city_info_df = self.city_info.get(year)
+        if city_info_df is None or city_info_df.empty:
+            # 如果指定年份不存在,尝试使用最接近的年份
+            available_years = sorted(self.city_info.keys())
+            if available_years:
+                # 找最接近的年份
+                year = min(available_years, key=lambda y: abs(y - year))
+                city_info_df = self.city_info.get(year)
+            else:
+                return None
+
+        if city_id not in city_info_df.index:
             return None
 
-        if city_id not in self.city_info.index:
-            return None
-
-        return self.city_info.loc[city_id].to_dict()
+        return city_info_df.loc[city_id].to_dict()

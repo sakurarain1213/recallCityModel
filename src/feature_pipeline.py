@@ -44,7 +44,8 @@ class FeaturePipeline:
             city_data_loader: CityDataLoader 实例
             data_dir: 历史数据目录
         """
-        self.city_info = city_data_loader.city_info
+        self.city_data_loader = city_data_loader  # 保存完整的 loader
+        self.city_info = city_data_loader.city_info  # 年度城市信息字典 {year: DataFrame}
         self.city_edges = city_data_loader.city_edges
         self.city_nodes = city_data_loader.city_info  # 兼容性别名
         self.data_dir = data_dir
@@ -57,7 +58,7 @@ class FeaturePipeline:
             df: 输入 DataFrame，必须包含基础列：
                 - Year, Type_ID, From_City, To_City
                 - 可选：Flow_Count, Rank, Label（训练时需要）
-            year: 当前年份（用于加载历史特征）
+            year: 当前年份（用于加载历史特征和获取对应年份的城市信息）
             mode: 模式，可选值：
                 - 'train': 训练模式（启用历史特征 Dropout）
                 - 'eval': 评估模式（不启用 Dropout）
@@ -78,7 +79,23 @@ class FeaturePipeline:
         if missing_cols:
             raise ValueError(f"缺少必要的列: {missing_cols}")
 
-        # 【步骤2】添加占位列（如果是预测模式且缺少这些列）
+        # 【步骤2】获取当前年份的城市信息
+        # 从年度城市信息字典中获取对应年份的数据
+        city_info_for_year = self.city_data_loader.get_city_info_for_year(year)
+        if city_info_for_year is None:
+            if verbose:
+                print(f"  Warning: Year {year} city info not found, trying closest year...")
+            # 尝试使用最接近的年份
+            available_years = sorted(self.city_info.keys())
+            if available_years:
+                closest_year = min(available_years, key=lambda y: abs(y - year))
+                city_info_for_year = self.city_info.get(closest_year)
+                if verbose:
+                    print(f"  Using city info from year {closest_year}")
+            else:
+                raise ValueError(f"No city info data available for any year!")
+
+        # 【步骤3】添加占位列（如果是预测模式且缺少这些列）
         if mode == 'predict':
             if 'Flow_Count' not in df.columns:
                 df['Flow_Count'] = 0
@@ -87,22 +104,23 @@ class FeaturePipeline:
             if 'Label' not in df.columns:
                 df['Label'] = 0
 
-        # 【步骤3】解析 Type_ID（拆解为 6 个维度）
+        # 【步骤4】解析 Type_ID（拆解为 6 个维度）
         if verbose:
             print(f"[1/4] Parsing Type_ID into 6 dimensions...")
         df, _ = parse_type_id(df, verbose=verbose)
 
-        # 【步骤4】添加城市特征（From_City 和 To_City 的属性 + 差异特征）
+        # 【步骤5】添加城市特征（From_City 和 To_City 的属性 + 差异特征）
+        # 使用当前年份的城市信息
         if verbose:
-            print(f"[2/4] Adding city features...")
+            print(f"[2/4] Adding city features for year {year}...")
         df = add_cross_features(
             df,
-            self.city_nodes,
+            city_info_for_year,  # 使用对应年份的城市信息
             self.city_edges,
             verbose=verbose
         )
 
-        # 【步骤5】添加历史特征
+        # 【步骤6】添加历史特征
         if verbose:
             print(f"[3/4] Adding historical features from year {year-1}...")
         training_mode = (mode == 'train')
@@ -114,12 +132,12 @@ class FeaturePipeline:
             training_mode=training_mode
         )
 
-        # 【步骤6】优化数据类型
+        # 【步骤7】优化数据类型
         if verbose:
             print(f"[4/4] Optimizing data types...")
         df = optimize_dtypes(df)
 
-        # 【步骤7】特征分离 (Feature Decoupling)
+        # 【步骤8】特征分离 (Feature Decoupling)
         # 如果是生成训练数据，删掉静态特征以节省空间
         # 静态特征列表 (必须与 static_city_pairs.parquet 一致)
         static_cols = ['geo_distance', 'dialect_distance'] + [c for c in df.columns if c.endswith('_ratio')]
@@ -131,7 +149,7 @@ class FeaturePipeline:
                 print(f"  [Decoupling] Dropping {len(cols_to_drop)} static features to save disk space...")
             df = df.drop(columns=cols_to_drop)
 
-        # 【步骤8】保留中间列用于历史特征匹配
+        # 【步骤9】保留中间列用于历史特征匹配
         # 注意：Type_ID_orig 和 From_City_orig 需要保留在保存的数据中
         # 因为后续年份会读取这些数据来构建历史特征
         # 只在训练/预测时才删除这些列（通过 get_feature_columns 方法）

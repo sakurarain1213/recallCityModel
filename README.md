@@ -1,291 +1,492 @@
-# 迁移排序模型 (Migration Ranker)
+# 人口流动预测模型
 
-基于 LightGBM LambdaRank 的人口迁移预测排序模型，用于预测各城市人群的迁移目的地 Top 20。
+# TODO
+特征工程优化  负样本的数量和选取规则优化
 
-## 项目结构
+
+基于 LightGBM 的人口流动预测模型，用于预测不同人群类型在城市间的流动方向和规模。采用召回模式(Recall Mode)，结合动态城市特征和历史流动数据训练模型。
+
 
 ```
-reranker-train/
-├── data/                       # 数据目录
-│   ├── migration.db           # DuckDB 数据库文件（迁移数据）
-│   ├── cities_data.jsonl      # 城市详细信息（经济、产业、人口等）
-│   ├── city_edges.jsonl       # 城市边关系（地理距离、方言距离）
-│   └── city_nodes.jsonl       # 城市节点（ID和名称映射）
-├── output/                     # 输出目录
-│   └── feature_importance.png # 特征重要性图
-├── src/
-│   ├── __init__.py
-│   ├── city_data.py           # 城市数据加载器（JSONL）
-│   ├── config.py              # 全局配置参数
-│   ├── data_loader.py         # 迁移数据加载与转换
-│   ├── feature_eng.py         # 特征工程（Type解析、历史特征、交叉特征）
-│   └── model.py               # LightGBM Ranker 模型
-├── main.py                    # 主训练脚本
-├── FEATURES.md                # 特征详细说明文档
-└── README.md                  # 本文件
+其中训练集加载.db每年的数据schema都是Year Month Type_ID Birth_Region From_City Total_Count Stay_Prob Outflow_Count To_Top1 To_Top1_Count To_Top2 To_Top2_Count To_Top3 To_Top3_Count To_Top4 To_Top4_Count To_Top5 To_Top5_Count To_Top6 To_Top6_Count To_Top7 To_Top7_Count To_Top8 To_Top8_Count To_Top9 To_Top9_Count To_Top10 To_Top10_Count To_Top11 To_Top11_Count To_Top12 To_Top12_Count To_Top13 To_Top13_Count To_Top14 To_Top14_Count To_Top15 To_Top15_Count To_Top16 To_Top16_Count To_Top17 To_Top17_Count To_Top18 To_Top18_Count To_Top19 To_Top19_Count To_Top20 To_Top20_Count 2002 12 F_30_EduHi_Service_IncML_Unit_5119 5119 巴中(5119) 6 0.990736 6 成都(5101) 2 重庆(5000) 0 达州(5117) 0 广元(5108) 0 绵阳(5107) 0 上海(3100) 0 南充(5113) 0 北京(1100) 0 遂宁(5109) 0 乌鲁木齐(6501) 0 攀枝花(5104) 0 德阳(5106) 0 广安(5116) 0 昆明(5301) 0 宜宾(5115) 0 天津(1200) 0 西安(6101) 0 泸州(5105) 0 汉中(6107) 0 贵阳(5201) 0 2020 12 F_40_EduLo_Wht_IncMH_Split_4453 4453 云浮(4453) 249 0.959849 239 广州(4401) 59 深圳(4403) 54 佛山(4406) 39 肇庆(4412) 20 江门(4407) 7 惠州(4413) 7 湛江(4408) 5 清远(4418) 2 上海(3100) 2 海口(4601) 2 珠海(4404) 2 阳江(4417) 2 韶关(4402) 2 重庆(5000) 2 北京(1100) 2 茂名(4409) 0 南宁(4501) 0 汕头(4405) 0 梧州(4504) 0 河源(4416) 0 2012 12 F_40_EduLo_Wht_IncH_Unit_4502 4502 柳州(4502) 69 0.812853 56 南宁(4501) 17 桂林(4503) 15 重庆(5000) 2 上海(3100) 2 梧州(4504) 2 百色(4510) 2 玉林(4509) 2 贵港(4508) 2 海口(4601) 0 北京(1100) 0 北海(4505) 0 深圳(4403) 0 贵阳(5201) 0 贺州(4511) 0 钦州(4507) 0 昆明(5301) 0 广州(4401) 0 乌鲁木齐(6501) 0 防城港(4506) 0 天津(1200) 0
+
+
+
+
+
+然后关于城市信息 每年都有337个城市属性 例如{"city_id": "1301", "city_name": "石家庄", "basic_info": {"tier": 3, "coordinates": [114.51, 38.04], "area_sqkm": 3738.0}, "economy": {"gdp_per_capita": 61000.4, "cpi_index": 102.5, "unemployment_rate": 0.046, "industry_sectors": {"agriculture": {"share": 0.175, "avg_wage": 3117, "vacancy_rate": 0.08}, "manufacturing": {"share": 0.38, "avg_wage": 6833, "vacancy_rate": 0.11}, "traditional_services": {"share": 0.302, "avg_wage": 3531, "vacancy_rate": 0.07}, "modern_services": {"share": 0.143, "avg_wage": 8968, "vacancy_rate": 0.04}}}, "demographics": {"age_structure": {"16_24": 0.093, "25_34": 0.145, "35_49": 0.264, "50_60": 0.207, "60_plus": 0.291}, "sex_ratio": 105.1}, "living_cost": {"housing_price_avg": 13485.0, "rent_avg": 747.0, "daily_cost_index": 1.03}, "public_services": {"medical_score": 0.73, "education_score": 0.68, "transport_convenience": 0.6, "avg_commute_mins": 35}, "social_context": {"population_total": 5823559, "migrant_stock_distribution": {"5000": 0.021, "3100": 0.021, "3500": 0.007}}, "ground_truth_cache": {"inflow_index_last_year": 3.29}}
+
+
+
+
+
+然后city edge的jsonl例如{"source_id": "1301", "target_id": "1302", "w_geo": 97.2, "w_dialect": 1.35, "w_admin": 0.0, "w_transport": 0.0} 是固定的 也只需要w_geo和w_dialect距离。 然后城市节点就是{"city_id": "1301", "name": "石家庄"}。然后特征人的属性就是DIMENSIONS = {
+
+    'D1': {'name': '性别', 'values': ['M', 'F']},
+
+    'D2': {'name': '生命周期', 'values': ['16-24', '25-34', '35-49', '50-60', '60+']},
+
+    'D3': {'name': '学历', 'values': ['EduLo', 'EduMid', 'EduHi']},
+
+    'D4': {'name': '行业赛道', 'values': ['Agri', 'Mfg', 'Service', 'Wht']},
+
+    'D5': {'name': '相对收入', 'values': ['IncL', 'IncML', 'IncM', 'IncMH', 'IncH']},
+
+    'D6': {'name': '家庭状态', 'values': ['Split', 'Unit']},
+
+}
+
 ```
 
-## 快速开始
 
-### 1. 环境配置
 
+
+
+
+## ✨ 主要特点
+
+- **年度动态城市特征**: 支持2000-2020年每年城市属性更新
+- **历史流动特征**: 利用历史数据提升预测准确性
+- **混合负样本策略**: 困难负样本(大城市) + 随机负样本，比例1:5
+- **二分类召回模型**: 使用 binary_logloss 训练，优化 Recall@K
+- **CPU/GPU支持**: 灵活选择训练后端
+
+---
+
+## 🚀 快速开始
+
+### 1. 环境设置
 ```bash
-# 初始化虚拟环境
-uv venv
-
 # 安装依赖
-uv pip install pandas numpy lightgbm duckdb matplotlib scikit-learn
+uv pip install -e .
 ```
 
-### 2. 数据准备
-
-#### 2.1 迁移数据（DuckDB）
-
-将迁移数据库文件放置到 `data/migration.db`。
-
-数据格式要求（宽表）：
-- `Year`: 年份
-- `Month`: 月份
-- `Type_ID`: 人群类型ID（格式：`F_20_EduHi_Service_IncML_Unit_1100`）
-- `From_City`: 出发城市（格式：`城市名(城市代码)`）
-- `Total_Count`: 总迁徙人数
-- `To_Top1` ~ `To_Top20`: Top 20 目的地城市
-- `To_Top1_Count` ~ `To_Top20_Count`: 对应的迁徙人数
-
-#### 2.2 城市数据（JSONL）
-
-确保 `data/` 目录下有以下三个 JSONL 文件：
-
-**1. cities_data.jsonl** - 城市详细信息
-```json
-{
-  "city_id": "1301",
-  "city_name": "石家庄",
-  "basic_info": {"tier": 3, "coordinates": [114.51, 38.04], "area_sqkm": 3738.0},
-  "economy": {
-    "gdp_per_capita": 61000.4,
-    "cpi_index": 102.5,
-    "unemployment_rate": 0.046,
-    "industry_sectors": {
-      "agriculture": {"share": 0.175, "avg_wage": 3117, "vacancy_rate": 0.08},
-      "manufacturing": {"share": 0.38, "avg_wage": 6833, "vacancy_rate": 0.11},
-      "traditional_services": {"share": 0.302, "avg_wage": 3531, "vacancy_rate": 0.07},
-      "modern_services": {"share": 0.143, "avg_wage": 8968, "vacancy_rate": 0.04}
-    }
-  },
-  "living_cost": {"housing_price_avg": 13485.0, "rent_avg": 747.0, "daily_cost_index": 1.03},
-  "public_services": {"medical_score": 0.73, "education_score": 0.68, "transport_convenience": 0.6, "avg_commute_mins": 35},
-  "social_context": {"population_total": 5823559}
-}
-```
-
-**2. city_edges.jsonl** - 城市边关系
-```json
-{"source_id": "1301", "target_id": "1302", "w_geo": 97.2, "w_dialect": 1.35, "w_admin": 0.0, "w_transport": 0.0}
-```
-注：只使用 `source_id`, `target_id`, `w_geo`（地理距离）, `w_dialect`（方言距离）
-
-**3. city_nodes.jsonl** - 城市节点
-```json
-{"city_id": "1301", "name": "石家庄"}
-```
-
-### 3. 运行训练
-
+### 2. 生成训练数据
 ```bash
-# Windows
-.venv\Scripts\python.exe main.py
-
-# Linux/Mac
-.venv/bin/python main.py
+uv run main.py
 ```
 
-## 特征说明
+### 3. 训练模型
+```bash
+# CPU训练
+uv run train.py
 
-### 输入特征（33个）
+# GPU训练
+uv run train.py --gpu
 
-#### 1. 类别特征（6个，从 Type_ID 解析）
-- `Feat_Gender`: 性别 (F/M)
-- `Feat_Age`: 年龄段
-- `Feat_Edu`: 教育水平
-- `Feat_Ind`: 行业类型
-- `Feat_Inc`: 收入水平
-- `Feat_Fam`: 家庭状况
-
-#### 2. 历史特征（4个，核心特征）
-- `Hist_LastYear_Count`: 去年该路径的迁徙人数
-- `Hist_LastYear_Score`: 去年该路径的标签值
-- `Hist_LastYear_Rank`: 去年该路径的排名
-- `Hist_LastYear_LogCount`: 去年迁徙人数的对数
-
-#### 3. 交叉特征（22个，城市属性差值）
-
-**边特征（2个）：**
-- `Cross_Geo_Distance`: 地理距离
-- `Cross_Dialect_Distance`: 方言距离
-
-**城市属性差值（20个）：**
-- `Cross_Diff_tier`: 城市等级差
-- `Cross_Diff_gdp_per_capita`: 人均GDP差
-- `Cross_Diff_cpi_index`: CPI指数差
-- `Cross_Diff_unemployment_rate`: 失业率差
-- `Cross_Diff_agriculture_share`: 农业占比差
-- `Cross_Diff_manufacturing_share`: 制造业占比差
-- `Cross_Diff_traditional_services_share`: 传统服务业占比差
-- `Cross_Diff_modern_services_share`: 现代服务业占比差
-- `Cross_Diff_agriculture_wage`: 农业工资差
-- `Cross_Diff_manufacturing_wage`: 制造业工资差
-- `Cross_Diff_traditional_services_wage`: 传统服务业工资差
-- `Cross_Diff_modern_services_wage`: 现代服务业工资差
-- `Cross_Diff_housing_price_avg`: 房价差
-- `Cross_Diff_rent_avg`: 租金差
-- `Cross_Diff_daily_cost_index`: 生活成本指数差
-- `Cross_Diff_medical_score`: 医疗评分差
-- `Cross_Diff_education_score`: 教育评分差
-- `Cross_Diff_transport_convenience`: 交通便利度差
-- `Cross_Diff_avg_commute_mins`: 平均通勤时间差
-- `Cross_Diff_population_total`: 总人口差
-
-#### 4. 其他特征（1个）
-- `Total_Count`: 该出发城市的总迁徙人数
-
-### 输出标签
-
-- **Label**: 整数排名标签
-  - Top1 → 20, Top2 → 19, ..., Top20 → 1
-  - 负样本 → 0
-
-详细特征说明请查看 [FEATURES.md](FEATURES.md)
-
-## 数据集划分
-
-针对 20 年数据（2001-2020）：
-
-- **训练集**: 2001-2017 (17年)
-- **验证集**: 2018 (1年)
-- **测试集**: 2019-2020 (2年)
-
-## 模型配置
-
-- **算法**: LightGBM LambdaRank
-- **目标函数**: lambdarank（直接优化排序）
-- **评估指标**: NDCG@10, NDCG@20
-- **负采样**: 每个查询采样 30 个负样本
-
-主要超参数：
-```python
-{
-    'n_estimators': 1000,
-    'learning_rate': 0.05,
-    'num_leaves': 31,
-    'subsample': 0.8,
-    'colsample_bytree': 0.8,
-}
+# 快速测试(只训练到2010年)
+uv run train.py --end_year 2010
 ```
 
-## 输出结果
-
-训练完成后，会在 `output/` 目录生成：
-
-1. **feature_importance.png**: 特征重要性图
-2. 控制台输出：
-   - 数据加载统计（337个城市，113232条边）
-   - 数据集划分统计
-   - 训练/验证 NDCG 指标
-   - 测试集样例预测结果
-
-## 使用真实数据
-
-修改 [main.py]
-
-```python
-# 注释掉模拟数据部分
-# 取消注释以下行
-df_raw = load_raw_data_from_duckdb(Config.DB_PATH)
+### 4. 评估模型
+```bash
+uv run evaluate.py
 ```
 
-确保 DuckDB 中的表名与 [src/data_loader.py](src/data_loader.py:11) 中的查询一致：
+详细使用说明请查看 [使用指南.md](使用指南.md)
 
+---
+
+## 📊 特征说明
+
+### 特征Schema
+
+保存到 Parquet 的列(~36个):
+
+| 类别 | 列名 | 类型 | 说明 |
+|------|------|------|------|
+| **基础标识** | Year | int16 | 年份 |
+| | Type_ID_orig | str | 原始Type_ID(用于历史特征匹配) |
+| | From_City_orig | str | 原始出发城市 |
+| | From_City | int16 | 出发城市ID |
+| | To_City | int16 | 目标城市ID |
+| | qid | int32 | 查询组ID |
+| **标签** | Rank | int16 | 原始排名 |
+| | Label | float32 | 二分类标签(Top10=1.0, Top11-20=0.1, 负样本=0.0) |
+| | Flow_Count | int32 | 实际流量 |
+| **Type_ID特征** | gender, age_group, education, industry, income, family | int8 | 6维人口类型特征 |
+| **城市特征** | geo_distance, dialect_distance | float32 | 地理距离和方言距离 |
+| | *_ratio (21个) | float32 | 城市属性差异ratio(To/From) |
+| **历史特征** | Hist_Flow_Log | float32 | log(去年流量+1) |
+| | Hist_Rank | int16 | 去年排名 |
+| | Hist_Label | float32 | 去年Label |
+| | Hist_Share | float32 | 去年流量占比 |
+| | Hist_Label_1y | int16 | 近1年Label |
+| | Hist_Label_3y_avg | float32 | 近3年平均Label |
+| | Hist_Label_5y_avg | float32 | 近5年平均Label |
+
+### 训练特征(~36个)
+
+排除以下列后用于训练:
 ```python
-df = con.query("SELECT * FROM migration_table").df()  # 替换为实际表名
-```
-
-## 核心改进
-
-### v2.0 更新（当前版本）
-
-   - 改用 JSONL 文件动态加载城市数据
-
-2. **完整的交叉特征**
-   - 添加地理距离和方言距离（从 city_edges.jsonl）
-   - 添加20个城市属性差值特征（从 cities_data.jsonl）
-   - 特征数量从 12 个增加到 33 个
-
-3. **模块化城市数据加载**
-   - 新增 `CityDataLoader` 类
-   - 支持城市信息、边关系、节点信息的独立加载
-   - 便于扩展和维护
-
-## 扩展功能
-
-### 1. 添加更多交叉特征
-
-在 [src/feature_eng.py](src/feature_eng.py:100) 的 `diff_attributes` 列表中添加新属性：
-
-```python
-diff_attributes = [
-    'tier', 'gdp_per_capita', 'cpi_index',
-    # 添加新属性
-    'your_new_attribute',
+exclude_cols = [
+    'Label',        # 标签
+    'To_City',      # 目标城市
+    'Flow_Count',   # 泄露特征
+    'Rank',         # 泄露特征
+    'Total_Count',   # 可能泄露
+    'qid',          # 查询组ID
+    'Type_ID_orig', 'From_City_orig'  # 中间列
 ]
 ```
 
-### 2. 调整负采样率
+实际使用的特征:
+- Year (1个)
+- Type_ID拆解特征 (6个)
+- From_City (1个, int16)
+- 城市特征 (23个: 2个距离 + 21个ratio)
+- 历史特征 (7个)
 
-修改 [src/config.py](src/config.py:31)：
+---
 
-```python
-NEG_SAMPLE_RATE = 50  # 增加负样本数量
+## 📈 模型架构
+
+### 训练流程
+1. 从DuckDB加载原始人口流动数据
+2. 为每年加载对应的城市特征数据(如2015年用cities_2015.jsonl)
+3. 生成混合负样本(50个困难负样本 + 50个随机负样本)
+4. 进行特征工程(人口类型、城市特征、历史特征)
+5. 使用LightGBM二分类训练(binary_logloss)
+
+### 预测流程
+给定一个查询(Year, Type_ID, From_City)，对337个候选城市全部打分:
+1. 生成查询-城市对特征
+2. 使用LightGBM模型预测分数
+3. 按分数排序取Top20
+4. 与真实Top20对比评估
+
+### 评估指标
+- **Recall@K**: Top K预测中实际正样本的比例(最重要指标)
+- **NDCG@K**: 归一化折损累计增益(排序质量)
+- **Precision@K**: Top K预测的精确率
+
+---
+
+## 🗂️ 数据文件说明
+
+### 数据结构
+```
+recall/
+├── data/
+│   ├── local_migration_data.db              # 人口流动数据库(DuckDB格式)
+│   ├── cities_2000-2020/                   # 年度城市特征目录
+│   │   ├── cities_2000.jsonl              # 2000年城市特征
+│   │   ├── cities_2001.jsonl              # 2001年城市特征
+│   │   ├── ...
+│   │   └── cities_2020.jsonl              # 2020年城市特征
+│   ├── city_edges.jsonl                     # 城市间距离关系
+│   └── city_nodes.jsonl                     # 城市基本信息
+├── output/                                   # 输出目录
+│   └── processed_data/                       # 处理后的训练数据
+└── src/                                      # 源代码
 ```
 
-### 3. 全量预测（测试集）
+### 数据库路径配置
+已在 `src/config.py` 中配置为:
+- **数据库**: `C:/Users/w1625/Desktop/recall/data/local_migration_data.db`
+- **年度城市数据**: `C:/Users/w1625/Desktop/recall/data/cities_2000-2020/`
 
-修改 [src/data_loader.py](src/data_loader.py:76-79)，在测试集使用全量城市：
+---
 
-```python
-# 测试集使用全量城市，不采样
-if is_test_set:
-    neg_samples = neg_candidates
-else:
-    # 训练集和验证集采样
-    if len(neg_candidates) > Config.NEG_SAMPLE_RATE:
-        neg_samples = random.sample(neg_candidates, Config.NEG_SAMPLE_RATE)
-```
+## 🚀 从零开始完整流程
 
-## 性能优化建议
+### 步骤1: 环境设置 ✅
 
-1. **大规模数据**: 使用 Spark 进行宽表到长表的转换
-2. **特征缓存**: 预计算历史特征和交叉特征并保存
-3. **并行计算**: 使用 `multiprocessing` 加速特征计算
-4. **模型调优**: 使用 Optuna 进行超参数搜索
-
-## 常见问题
-
-### Q: 训练时 NDCG 达到 1.0 是否正常？
-
-A: 在模拟数据或数据量较小时可能出现。使用真实数据后，NDCG 通常在 0.7-0.9 之间。
-
-### Q: 如何处理新出现的城市？
-
-A: 模型会依赖交叉特征（距离、GDP、产业结构等）来预测新路径。确保 JSONL 文件包含所有城市信息。
-
-### Q: 历史特征缺失怎么办？
-
-A: 代码已处理缺失值填充（填充为 0 或 999）。第一年数据无历史特征是正常的。
-
-### Q: JSONL 文件格式错误怎么办？
-
-A: 确保每行是一个有效的 JSON 对象，使用 UTF-8 编码。可以用 `jq` 工具验证：
+已完成:
 ```bash
-cat data/cities_data.jsonl | jq . > /dev/null
+# 1. 创建虚拟环境
+uv venv
+
+# 2. 安装依赖
+uv pip install -e .
 ```
+
+如果需要重新激活虚拟环境:
+```bash
+# Windows (CMD)
+.venv\Scripts\activate
+
+# Windows (PowerShell)
+.venv\Scripts\Activate.ps1
+```
+
+### 步骤2: 生成训练数据
+
+运行主程序生成处理后的训练数据:
+
+```bash
+uv run main.py
+```
+
+**这一步会做什么:**
+1. 从 DuckDB 加载原始人口流动数据(2000-2020年)
+2. 为每年加载对应的城市特征数据(例如处理2015年数据时使用cities_2015.jsonl)
+3. 生成混合负样本(30个困难负样本 + 30个随机负样本)
+4. 进行特征工程(人口类型特征、城市特征、历史特征)
+5. 保存处理后的数据到 `output/processed_data/` 目录
+
+**输出文件:**
+```
+output/processed_data/
+├── processed_2000.parquet    # 2000年数据(仅用于历史特征)
+├── processed_2001.parquet
+├── ...
+└── processed_2020.parquet
+```
+
+**预计时间:** 10-30分钟(取决于CPU性能)
+
+### 步骤3: 训练模型
+
+训练 LightGBM 模型:
+
+```bash
+# CPU训练(完整数据: 2001-2017训练, 2018验证, 2019-2020测试)
+uv run train.py
+
+# 快速测试(训练到2010年)
+uv run train.py --end_year 2010
+
+# GPU训练(需要安装 lightgbm-gpu)
+uv run train.py --gpu
+
+# GPU训练 + 快速测试
+uv run train.py --end_year 2010 --gpu
+```
+
+**训练参数说明:**
+- `--end_year`: 训练截止年份(默认2020)
+  - 自动划分: 训练集(2001 到 end_year-3), 验证集(end_year-2), 测试集(end_year-1 到 end_year)
+- `--gpu`: 启用GPU加速训练
+
+**输出文件:**
+```
+output/
+├── lgb_model_2017.txt                 # 训练好的模型
+├── training_history.png               # 训练曲线图
+├── feature_importance.png             # 特征重要性图
+└── training_metrics.txt              # 训练指标记录
+```
+
+**预计时间:**
+- CPU: 30-60分钟
+- GPU: 10-20分钟
+
+### 步骤4: 评估模型
+
+评估模型性能并查看召回效果:
+
+```bash
+uv run evaluate.py
+```
+
+**这一步会做什么:**
+1. 加载训练好的模型
+2. 在测试集(2019-2020年)上评估
+3. 计算召回率@K、NDCG@K等指标
+4. 生成详细的评估报告
+
+**输出:**
+- 控制台打印评估指标
+- 各年份的详细性能分析
+
+**关键指标:**
+- **Recall@K**: Top K预测中实际正样本的比例
+- **NDCG@K**: 归一化折损累计增益
+- **Precision@K**: Top K预测的精确率
+
+### 步骤5: (可选) 预处理静态特征
+
+如果要使用静态特征优化(可选):
+
+```bash
+uv run evaluate_pre.py
+```
+
+---
+
+## 📊 查看Recall效果
+
+### 评估指标说明
+
+运行 `uv run evaluate.py` 后，你会看到类似以下输出:
+
+```
+========================================
+开始评估年份: 2010
+========================================
+Step 1: 加载测试集 Ground Truth...      
+[SQL] Loaded 357600 rows
+[Wide-to-Long] Generated 3153120 positive samples
+[Negative Sampling] Added 292616 negative samples (Target: 1 per query)
+[Final] Total: 3445736 rows
+⚠️ 进行采样评估: 1000/302873
+Step 2: 生成候选集 (1000 Queries x 337 Cities)...
+候选集大小: 336,000 行
+Step 3: 特征工程...
+Step 4: 模型打分...
+Step 5: 计算评估指标...
+
+========================================
+📊 评估结果报告 (2010)
+========================================
+Query样本数 : 302873
+平均正样本数 : 10.41
+------------------------------
+Recall@1   : 0.01%
+Recall@5   : 0.06%
+Recall@10  : 0.10%
+Recall@20  : 0.16%
+========================================
+```
+
+### 指标解读
+
+1. **Recall@K**: 模型预测的Top K个城市中，有多少是真实的目标城市
+   - Recall@10 = 0.85 表示: 在预测的前10个城市中，平均能找到85%的真实目标城市
+   - 这是**最重要的指标**，衡量召回能力
+
+2. **NDCG@K**: 考虑排名位置的质量指标
+   - 越接近1越好，表示排序质量高
+   - 真实目标城市排在越前面，NDCG越高
+
+3. **Precision@K**: Top K预测的准确率
+   - Precision@10 = 0.086 表示: Top 10预测中，平均有8.6%是正确的
+
+### 可视化结果
+
+训练完成后，查看生成的图表:
+
+1. **训练曲线** (`output/training_history.png`)
+   - 显示训练集和验证集的LogLoss变化
+   - 用于判断是否过拟合
+
+2. **特征重要性** (`output/feature_importance.png`)
+   - 显示哪些特征对预测最重要
+   - 帮助理解模型决策
+
+---
+
+## 🔧 常见问题
+
+### Q1: 如何只处理某几年的数据?
+
+修改 `src/config.py` 中的配置:
+```python
+DATA_START_YEAR = 2000  # 起始年份
+TRAIN_START_YEAR = 2001  # 训练起始年份
+TRAIN_END_YEAR = 2017    # 训练结束年份
+VAL_YEARS = [2018]       # 验证年份
+TEST_YEARS = [2019, 2020]  # 测试年份
+```
+
+或使用命令行参数:
+```bash
+uv run train.py --end_year 2015  # 只训练到2015年
+```
+
+### Q2: 内存不足怎么办?
+
+如果内存不足，可以:
+1. 减少负样本数量(`Config.NEG_SAMPLE_RATE`从60改为30)
+2. 减少训练年份范围
+3. 使用 `--end_year` 参数减少数据量
+
+### Q3: 如何使用GPU训练?
+
+1. 确保安装了GPU版本的LightGBM:
+```bash
+uv pip install lightgbm --gpu
+```
+
+2. 添加 `--gpu` 参数:
+```bash
+uv run train.py --gpu
+```
+
+### Q4: 数据已经处理过了，如何跳过?
+
+`main.py` 会自动跳过已存在的年份:
+```
+Year 2015: Already processed, skipping
+```
+
+如需重新处理，删除对应文件:
+```bash
+rm output/processed_data/processed_2015.parquet
+```
+
+### Q5: 年度城市数据加载失败?
+
+确保以下路径正确:
+- 城市数据目录: `C:/Users/w1625/Desktop/recall/data/cities_2000-2020/`
+- 年度文件格式: `cities_2000.jsonl`, `cities_2001.jsonl`, ..., `cities_2020.jsonl`
+
+检查文件是否存在:
+```bash
+ls data/cities_2000-2020/
+```
+
+---
+
+## 📝 代码变更说明
+
+### 修改的文件
+
+1. **src/config.py**
+   - 更新数据库路径为绝对路径
+   - 添加年度城市数据目录配置 `CITY_INFO_DIR`
+
+2. **src/city_data.py**
+   - `CityDataLoader.city_info` 从 DataFrame 改为字典 `{year: DataFrame}`
+   - `load_city_info()` 支持按年份加载
+   - 新增 `get_city_info_for_year(year)` 方法
+   - `get_city_attributes()` 支持指定年份
+
+3. **src/feature_pipeline.py**
+   - `FeaturePipeline` 在transform时根据Year列自动获取对应年份的城市信息
+   - 确保特征工程使用正确年份的城市特征
+
+4. **main.py**
+   - 加载所有年份(2000-2020)的城市数据
+   - 使用2010年数据作为困难负样本候选池基准
+
+### 不需要修改的文件
+
+- `src/data_loader.py` - 数据加载逻辑不变
+- `src/feature_eng.py` - 特征工程逻辑不变
+- `src/historical_features.py` - 历史特征逻辑不变
+- `train.py` - 训练逻辑不变
+- `evaluate.py` - 评估逻辑不变
+
+---
+
+## 🎯 下一步
+
+1. **运行完整流程:**
+   ```bash
+   uv run main.py      # 生成数据(首次运行)
+   uv run train.py     # 训练模型
+   uv run evaluate.py  # 评估效果
+   ```
+
+2. **查看结果:**
+   - 检查 `output/` 目录下的模型和图表
+   - 查看 Recall@10 指标是否达到预期(>0.8)
+
+3. **优化模型:**
+   - 调整 `Config.LGBM_PARAMS` 中的超参数
+   - 尝试不同的特征组合
+   - 增加训练数据量
+
+---
+
+## 📞 技术支持
+
+如有问题，检查:
+1. Python版本 >= 3.11
+2. 所有依赖已安装: `uv pip list`
+3. 数据文件路径正确
+4. 虚拟环境已激活
+
+祝训练顺利! 🎉

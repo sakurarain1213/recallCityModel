@@ -2,24 +2,25 @@ import os
 
 class Config:
     # 路径配置
-    DB_PATH = 'data/local_migration_data.db'
-    DATA_DIR = 'data'  # JSONL 文件目录
+    DB_PATH = 'C:/Users/w1625/Desktop/recall/data/local_migration_data.db'
+    DATA_DIR = 'C:/Users/w1625/Desktop/recall/data'  # JSONL 文件目录
     OUTPUT_DIR = 'output'
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     # JSONL 文件路径
-    CITY_INFO_PATH = 'data/cities_data.jsonl'    # 城市详细信息
-    CITY_EDGES_PATH = 'data/city_edges.jsonl'    # 城市边关系（距离）
-    CITY_NODES_PATH = 'data/city_nodes.jsonl'    # 城市节点（ID和名称）
+    # 城市详细信息现在是年度文件: cities_2000.jsonl 到 cities_2020.jsonl
+    CITY_INFO_DIR = 'C:/Users/w1625/Desktop/recall/data/cities_2000-2020'  # 年度城市信息文件目录
+    CITY_EDGES_PATH = 'C:/Users/w1625/Desktop/recall/data/city_edges.jsonl'    # 城市边关系（距离）
+    CITY_NODES_PATH = 'C:/Users/w1625/Desktop/recall/data/city_nodes.jsonl'    # 城市节点（ID和名称）
 
     # 训练参数
     SEED = 42
 
     # 【召回模式】负样本采样率：混合采样策略
-    # 策略：30个困难负样本（大城市）+ 30个随机负样本（任意城市）
-    # 结果：每个Query有 20个正样本(Top1-20) + 60个混合负样本 = 80条数据
-    # 目的：解决小城市高分问题，让模型学会区分"距离近但无关"的城市
-    NEG_SAMPLE_RATE = 60
+    # 策略：50个困难负样本（大城市）+ 50个随机负样本（任意城市）
+    # 结果：每个Query有 20个正样本(Top1-20) + 100个混合负样本 = 120条数据
+    # 目的：增加负样本数量，提高模型在更多干扰项下的区分能力，提升Recall@10
+    NEG_SAMPLE_RATE = 100  # 从60提升到100，负样本比例从1:3提升到1:5
 
     # 数据集划分（21年数据：2000-2020）
     # 2000年仅用于提供历史特征，不参与训练
