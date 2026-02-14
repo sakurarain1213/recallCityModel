@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 # 导入 src 模块
 from src.config import Config
 from src.city_data import CityDataLoader
-from src.data_loader_v2 import load_raw_data_fast
+from src.data_loader import load_raw_data_fast
 from src.feature_eng import parse_type_id
 from src.historical_features import add_historical_features
 

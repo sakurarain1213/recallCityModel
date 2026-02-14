@@ -1,11 +1,15 @@
 import os
 
 class Config:
-    # 路径配置
+    # --- 路径配置 ---
     DB_PATH = '/data1/wxj/Recall_city_project/data/local_migration_data.db'
-    DATA_DIR = '/data1/wxj/Recall_city_project/data'  # JSONL 文件目录
+    DATA_DIR = '/data1/wxj/Recall_city_project/data'
+    CITY_INFO_DIR = '/data1/wxj/Recall_city_project/data/cities_2000-2020'
     OUTPUT_DIR = 'output'
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    # 预处理数据的存储目录 (新)
+    PROCESSED_DIR = os.path.join(OUTPUT_DIR, 'processed_ready')
+    os.makedirs(PROCESSED_DIR, exist_ok=True)
 
     # JSONL 文件路径
     # 城市详细信息现在是年度文件: cities_2000.jsonl 到 cities_2020.jsonl
@@ -13,19 +17,19 @@ class Config:
     CITY_EDGES_PATH = '/data1/wxj/Recall_city_project/data/city_edges.jsonl'    # 城市边关系（距离）
     CITY_NODES_PATH = '/data1/wxj/Recall_city_project/data/city_nodes.jsonl'    # 城市节点（ID和名称）
 
-    # 训练参数
-    SEED = 42
+    # --- 采样策略 (严格 1:4) ---
+    # 一个 Query 总样本数 = 50
+    # 构成: 10个正样本 (Rank 1-10) + 10个困难负样本 (Rank 11-20) + 30个补充负样本
+    TOTAL_SAMPLES_PER_QUERY = 50
 
-    # 【User Req 5】负样本目标数量
-    NEG_SAMPLE_RATE = 40  # 1个正样本 : 40个负样本 (Top10正样本共10个，所以比例约 1:4)
-
-    # 【User Req 5】全局热门城市 (Hard Global Negatives)
-    # 这些城市如果在Ground Truth Top10之外，就是极强的干扰项
-    # 包含: 北上广深 + 成都/杭州/重庆/武汉/西安/苏州/南京/天津/郑州/长沙/东莞/佛山
+    # 困难负样本池 (热门城市 ID)
     POPULAR_CITIES = [
         1100, 3100, 4401, 4403,  # 一线
         5101, 3301, 5000, 4201, 6101, 3205, 3201, 1200, 4101, 4301, 4419, 4406 # 新一线
     ]
+
+    # 训练参数
+    SEED = 42
 
     # 数据集划分
     DATA_START_YEAR = 2000
@@ -69,23 +73,35 @@ class Config:
     TRAIN_END_YEAR = 2003
     VAL_YEARS = [2008]
 
-    # 【User Req 3】模型参数调整 (增加深度，处理非线性)
+    # --- LightGBM 参数 (CPU 极速版) ---
     LGBM_PARAMS = {
         'objective': 'binary',
         'metric': ['binary_logloss', 'auc'],
         'boosting_type': 'gbdt',
-        'n_estimators': 3000,     # 增加树数量
-        'learning_rate': 0.03,    # 降低学习率以适应Batch训练
-        'num_leaves': 255,        # 【User Req 3】大幅增加叶子节点 (原本127)
-        'max_depth': 12,          # 【User Req 3】限制深度防止过拟合 (配合num_leaves)
-        'min_child_samples': 50,
-        'subsample': 0.8,
-        'colsample_bytree': 0.7,
-        'lambda_l1': 0.5,
-        'lambda_l2': 0.5,
-        'n_jobs': -1,
-        'verbosity': -1,
-        'first_metric_only': True
+
+        # 【速度优化核心 1】大幅减少树的复杂度
+        # Recall 任务不需要拟合太细的残差，63 叶子 + 8 深足够区分 Top10 和 Top100
+        'num_leaves': 63,         # 原 255 -> 63
+        'max_depth': 8,           # 原 12 -> 8
+
+        # 【速度优化核心 2】CPU 训练的神器：减少分桶
+        # 默认 255，降为 63 可提升 3-5 倍速度，精度损失极小
+        'max_bin': 63,
+
+        # 【速度优化核心 3】增加学习率，减少树数量
+        'learning_rate': 0.05,    # 原 0.03 -> 0.05
+        'n_estimators': 2000,     # 原 3000 -> 2000 (配合早停)
+
+        # 采样与正则化
+        'subsample': 0.8,         # 行采样
+        'subsample_freq': 5,      # 每5轮做一次采样
+        'colsample_bytree': 0.8,  # 列采样
+        'min_child_samples': 100, # 防止过拟合
+        'lambda_l1': 0.1,
+        'lambda_l2': 0.1,
+
+        'n_jobs': -1,             # 跑满 CPU
+        'verbosity': -1
     }
 
     # GPU 参数
