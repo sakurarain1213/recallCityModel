@@ -151,8 +151,8 @@ def train_batch_mode(target_end_year, batch_size_years=3):
                 init_model=model,            # 继承上一轮的模型
                 keep_training_booster=True,  # 允许下一轮继续训练
                 callbacks=[
-                    lgb.early_stopping(stopping_rounds=50, verbose=True),
-                    lgb.log_evaluation(50)
+                    lgb.early_stopping(stopping_rounds=20, verbose=True),
+                    lgb.log_evaluation(10)
                 ]
             )
         except Exception as e:
