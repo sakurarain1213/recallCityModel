@@ -1,3 +1,16 @@
+```
+服务器版本
+本地： ssh -p 2023 -R 10080:127.0.0.1:7890 -N wxj@10.82.1.210
+服务器：
+cd /data1/wxj/Recall_city_project
+unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
+export http_proxy="http://127.0.0.1:10080"
+export https_proxy="http://127.0.0.1:10080"
+export HTTP_PROXY="http://127.0.0.1:10080"
+export HTTPS_PROXY="http://127.0.0.1:10080"
+curl -v https://api.github.com  
+```
+
 # 人口流动预测模型
 
 # TODO
@@ -201,8 +214,8 @@ recall/
 
 ### 数据库路径配置
 已在 `src/config.py` 中配置为:
-- **数据库**: `C:/Users/w1625/Desktop/recall/data/local_migration_data.db`
-- **年度城市数据**: `C:/Users/w1625/Desktop/recall/data/cities_2000-2020/`
+- **数据库**: `/data1/wxj/Recall_city_project/data/local_migration_data.db`
+- **年度城市数据**: `/data1/wxj/Recall_city_project/data/cities_2000-2020/`
 
 ---
 
@@ -437,7 +450,7 @@ rm output/processed_data/processed_2015.parquet
 ### Q5: 年度城市数据加载失败?
 
 确保以下路径正确:
-- 城市数据目录: `C:/Users/w1625/Desktop/recall/data/cities_2000-2020/`
+- 城市数据目录: `/data1/wxj/Recall_city_project/data/cities_2000-2020/`
 - 年度文件格式: `cities_2000.jsonl`, `cities_2001.jsonl`, ..., `cities_2020.jsonl`
 
 检查文件是否存在:

@@ -10,7 +10,7 @@ from pathlib import Path
 class CityDataLoader:
     """城市数据加载器"""
 
-    def __init__(self, data_dir='C:/Users/w1625/Desktop/recall/data'):
+    def __init__(self, data_dir='/data1/wxj/Recall_city_project/data'):
         self.data_dir = Path(data_dir)
         self.city_info_dir = self.data_dir / 'cities_2000-2020'  # 年度城市信息目录
         self.city_info = {}  # 改为字典,按年份存储: {year: DataFrame}

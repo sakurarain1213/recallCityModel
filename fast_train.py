@@ -63,8 +63,8 @@ def generate_batches(end_year, start_year=2001):
     val_years = [end_year - 2, end_year - 1]
     train_end = end_year - 3
 
-    # 【内存关键】如果内存依然紧张，将此处的 3 改为 2
-    BATCH_SIZE = 2
+    # 【内存关键】每批训练多少年的数据 如果内存依然紧张，将此处的 3 改为 2
+    BATCH_SIZE = 5
     
     batches = []
     current = start_year

@@ -2,16 +2,16 @@ import os
 
 class Config:
     # 路径配置
-    DB_PATH = 'C:/Users/w1625/Desktop/recall/data/local_migration_data.db'
-    DATA_DIR = 'C:/Users/w1625/Desktop/recall/data'  # JSONL 文件目录
+    DB_PATH = '/data1/wxj/Recall_city_project/data/local_migration_data.db'
+    DATA_DIR = '/data1/wxj/Recall_city_project/data'  # JSONL 文件目录
     OUTPUT_DIR = 'output'
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     # JSONL 文件路径
     # 城市详细信息现在是年度文件: cities_2000.jsonl 到 cities_2020.jsonl
-    CITY_INFO_DIR = 'C:/Users/w1625/Desktop/recall/data/cities_2000-2020'  # 年度城市信息文件目录
-    CITY_EDGES_PATH = 'C:/Users/w1625/Desktop/recall/data/city_edges.jsonl'    # 城市边关系（距离）
-    CITY_NODES_PATH = 'C:/Users/w1625/Desktop/recall/data/city_nodes.jsonl'    # 城市节点（ID和名称）
+    CITY_INFO_DIR = '/data1/wxj/Recall_city_project/data/cities_2000-2020'  # 年度城市信息文件目录
+    CITY_EDGES_PATH = '/data1/wxj/Recall_city_project/data/city_edges.jsonl'    # 城市边关系（距离）
+    CITY_NODES_PATH = '/data1/wxj/Recall_city_project/data/city_nodes.jsonl'    # 城市节点（ID和名称）
 
     # 训练参数
     SEED = 42
