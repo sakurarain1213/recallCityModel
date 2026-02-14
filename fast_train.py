@@ -1,240 +1,332 @@
 """
-快速训练脚本 (最终修复版) - 修复 evals_result 报错
-
-修复内容:
-1. 修复 'Booster' object has no attribute 'evals_result_' 报错
-2. 正确使用 lgb.train 的 evals_result 参数来捕获 loss
+分批训练模式 + 内存极致优化版 (Numpy-First Strategy)
 """
-
 import gc
+import argparse
 import pandas as pd
 import numpy as np
 from pathlib import Path
 import lightgbm as lgb
 import matplotlib.pyplot as plt
-from tqdm import tqdm
-import shutil
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 from src.config import Config
 from src.city_data import CityDataLoader
 from src.data_loader_v2 import load_raw_data_fast
-from src.feature_eng import parse_type_id, optimize_dtypes
-from src.historical_features import add_historical_features
+from src.feature_pipeline import FeaturePipeline
+from evaluate import evaluate_year, EvalContext
 
 # 设置中文字体
-plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei']
+plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS']
 plt.rcParams['axes.unicode_minus'] = False
 
-# 缓存目录
-CACHE_DIR = Path(Config.OUTPUT_DIR) / 'cache'
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
+def get_year_data(year, pipeline, hard_candidates, mode='train'):
+    """
+    获取一年的数据
+    """
+    cache_file = Path(Config.OUTPUT_DIR) / 'cache' / f"processed_{year}.parquet"
 
-def get_year_data(year, global_features, hard_candidates, neg_sample_rate, is_training=True):
-    """
-    获取一年的数据：
-    1. 优先检查硬盘缓存 (output/cache/train_20xx.parquet)
-    2. 如果没有缓存，则从 DuckDB 加载并处理，然后保存缓存
-    """
-    cache_file = CACHE_DIR / f"processed_{year}.parquet"
-    
-    # A. 命中缓存，直接读取
+    # 1. 尝试读取缓存
     if cache_file.exists():
-        # print(f"  [缓存命中] 从硬盘加载 {year} 年数据...")
         try:
-            df = pd.read_parquet(cache_file)
-            if 'Label' in df.columns:
-                return df
-        except Exception as e:
-            print(f"  [缓存损坏] 读取失败: {e}，将重新生成...")
-            try: cache_file.unlink() 
-            except: pass
+            return pd.read_parquet(cache_file, engine='pyarrow')
+        except:
+            pass
 
-    # B. 无缓存，重新生成
-    print(f"  [生成数据] 处理 {year} 年原始数据...")
+    print(f"  [Processing] Generating data for Year {year}...")
+
+    # 2. 加载原始数据
+    df = load_raw_data_fast(Config.DB_PATH, year, hard_candidates, Config.NEG_SAMPLE_RATE)
+    if df.empty:
+        return None
+
+    # 3. 特征工程
+    df = pipeline.transform(df, year, mode=mode, verbose=False)
+
+    # 4. 写入缓存 (优化类型)
+    for col in df.select_dtypes(include=['object', 'string']).columns:
+        df[col] = df[col].astype('category')
     
-    # 1. 加载宽表
-    df = load_raw_data_fast(
-        Config.DB_PATH,
-        year,
-        hard_candidates,
-        neg_sample_rate=neg_sample_rate
-    )
-    if df.empty: return None
+    # 强制 float32
+    f_cols = df.select_dtypes(include=['float64']).columns
+    if len(f_cols) > 0:
+        df[f_cols] = df[f_cols].astype('float32')
 
-    # 2. Merge 全局特征
-    df = df.merge(global_features, on=['Year', 'From_City', 'To_City'], how='left')
+    table = pa.Table.from_pandas(df, nthreads=4)
+    cache_file.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(table, str(cache_file), compression='snappy', use_dictionary=True, write_statistics=False)
 
-    # 3. 解析 Type_ID
-    df, _ = parse_type_id(df, verbose=False)
-
-    # 4. 添加历史特征
-    df = add_historical_features(
-        df,
-        year,
-        Path(Config.OUTPUT_DIR) / 'processed_data',
-        verbose=False,
-        training_mode=is_training
-    )
-
-    # 5. 优化类型
-    df = optimize_dtypes(df)
-
-    # 6. 保存缓存到硬盘
-    print(f"  [写入缓存] 保存至 {cache_file} ...")
-    df.to_parquet(cache_file, index=False)
-    
     return df
 
-def fast_train(end_year=None, use_gpu=False):
-    # 0. 参数配置 (建议保持 10)
-    CURRENT_NEG_RATE = 10
+def generate_batches(end_year, start_year=2001):
+    val_years = [end_year - 2, end_year - 1]
+    train_end = end_year - 3
+
+    # 【内存关键】如果内存依然紧张，将此处的 3 改为 2
+    BATCH_SIZE = 2
     
-    if end_year is None:
-        train_years = list(range(Config.TRAIN_START_YEAR, Config.TRAIN_END_YEAR + 1))
-        val_years = Config.VAL_YEARS
-    else:
-        val_year = end_year - 1
-        train_years = list(range(Config.TRAIN_START_YEAR, val_year))
-        val_years = [val_year]
+    batches = []
+    current = start_year
+    batch_idx = 1
 
-    print(f"训练年份序列: {train_years}")
-    print(f"验证年份: {val_years}")
-    print(f"缓存目录: {CACHE_DIR}")
+    while current <= train_end:
+        batch_years = []
+        for _ in range(BATCH_SIZE):
+            if current <= train_end:
+                batch_years.append(current)
+                current += 1
 
-    # 1. 准备基础数据
-    print("\nStep 1: 加载基础配置...")
-    city_loader = CityDataLoader(Config.DATA_DIR)
-    city_loader.load_all()
+        if batch_years:
+            batches.append({
+                'name': f'batch_{batch_idx}_{min(batch_years)}-{max(batch_years)}',
+                'train_years': batch_years,
+                'val_years': val_years
+            })
+            batch_idx += 1
+
+    return batches, val_years
+
+def train_dynamic(target_end_year, use_gpu=False):
+    print(f"🚀 启动动态分批训练 (Numpy优化版) | 目标预测年份: {target_end_year}")
+
+    # 1. 初始化资源
+    loader = CityDataLoader(Config.DATA_DIR).load_all()
+    pipeline = FeaturePipeline(loader, data_dir=Path(Config.OUTPUT_DIR)/'cache')
+    hard_candidates = loader.get_city_ids()
+
+    # 2. 生成 Batches
+    batches, val_years = generate_batches(target_end_year, start_year=Config.DATA_START_YEAR + 1)
     
-    city_info_2010 = city_loader.get_city_info_for_year(2010)
-    if city_info_2010 is None:
-        avail = sorted(city_loader.city_info.keys())
-        city_info_2010 = city_loader.get_city_info_for_year(avail[0])
-        
-    tier_cities = city_info_2010[city_info_2010['tier'] <= 2].index.tolist()
-    core_cities = [
-        1100, 1200, 1300, 1400, 1500, 2100, 2200, 2300, 3100, 3200, 
-        3300, 3400, 3500, 3600, 3700, 4100, 4200, 4300, 4400, 4500, 
-        4600, 5000, 5100, 5200, 5300, 5400, 6100, 6200, 6300, 6400, 6500
-    ]
-    hard_candidates = list(set([int(c) for c in tier_cities] + core_cities))
+    print(f"📅 验证集: {val_years}")
+    for b in batches:
+        print(f"  - {b['name']}: {b['train_years']}")
 
-    # 2. 加载全局特征表
-    print("\nStep 2: 加载全局特征表...")
-    global_features_path = Path(Config.OUTPUT_DIR) / 'global_city_features.parquet'
-    if not global_features_path.exists():
-        print("❌ 未找到 output/global_city_features.parquet")
-        return
-    global_features = pd.read_parquet(global_features_path)
-    global_features['From_City'] = global_features['From_City'].astype('int16')
-    global_features['To_City'] = global_features['To_City'].astype('int16')
-
-    # 3. 准备验证集
-    print(f"\nStep 3: 准备验证集 {val_years}...")
+    # 3. 预加载验证集 (带采样优化)
+    print(f"\n📦 预加载验证集 {val_years}...")
     val_dfs = []
     for yr in val_years:
-        df = get_year_data(yr, global_features, hard_candidates, CURRENT_NEG_RATE, is_training=False)
-        if df is not None:
+        df = get_year_data(yr, pipeline, hard_candidates, mode='eval')
+        if df is not None: 
             val_dfs.append(df)
             
     if not val_dfs:
-        print("❌ 验证集为空！")
+        print("❌ 验证集为空")
         return
 
-    df_val = pd.concat(val_dfs, axis=0, ignore_index=True)
-    exclude_cols = ['Year', 'qid', 'Type_ID_orig', 'From_City_orig', 'To_City', 'Flow_Count', 'Rank', 'Label']
-    feature_cols = [c for c in df_val.columns if c not in exclude_cols]
+    full_val = pd.concat(val_dfs, axis=0, ignore_index=True)
+    feature_cols = pipeline.get_feature_columns(full_val)
     
-    print(f"验证集大小: {len(df_val):,} 行")
-    print(f"特征数量: {len(feature_cols)}")
+    # 【内存优化 A】验证集采样
+    # 3000万验证集太大，限制在 500 万行以内足以评估
+    MAX_VAL_SIZE = 5000000 
+    if len(full_val) > MAX_VAL_SIZE:
+        print(f"  ⚠️ 验证集过大 ({len(full_val):,})，采样至 {MAX_VAL_SIZE:,} 行以节省内存...")
+        full_val = full_val.sample(n=MAX_VAL_SIZE, random_state=42)
     
-    X_val = df_val[feature_cols]
-    y_val = df_val['Label']
-    val_data = lgb.Dataset(X_val, label=y_val, free_raw_data=False).construct()
+    print(f"  ⚡ 转换验证集为 Numpy Float32...")
+    # 显式转换为 numpy float32，避免隐式 float64
+    val_X = full_val[feature_cols].values.astype(np.float32)
+    val_y = full_val['Label'].values.astype(np.float32)
     
-    del df_val, X_val, y_val
+    # 立即释放 DataFrame
+    del full_val, val_dfs
     gc.collect()
 
-    # 4. 增量训练循环
-    print("\nStep 4: 开始增量训练...")
-    
-    params = Config.LGBM_PARAMS_GPU if use_gpu else Config.LGBM_PARAMS
-    params.update({
-        'n_estimators': 100,
-        'num_leaves': 31,
-        'learning_rate': 0.1,
-        'n_jobs': -1,
-        'verbosity': -1,
-        'keep_training_booster': True 
-    })
-    
+    print(f"✅ 验证集就绪: {len(val_X):,} 行")
+
+    # 【修复 Batch 2 报错的关键】
+    # 验证集必须保留 Raw Data (False)，因为它要被多个 Batch 重复使用
+    # 训练集使用 True (节省内存)，验证集使用 False (兼容多轮训练)
+
+    # 【修正】定义类别特征列表
+    categorical_feats = ['From_City', 'is_same_province']
+    categorical_feats = [c for c in categorical_feats if c in feature_cols]
+
+    val_ds = lgb.Dataset(
+        val_X,
+        label=val_y,
+        feature_name=feature_cols,        # 关键：传入特征名列表
+        categorical_feature=categorical_feats, # 关键：指定类别特征
+        free_raw_data=False
+    )
+
+    # 注意：因为 free_raw_data=False，val_ds 会持有 val_X 的引用
+    # 所以这里不能删除 val_X，否则 val_ds 也会失效
+    # LightGBM 会自动管理这部分内存（约 0.7GB，在可接受范围内）
+
+    # 4. 逐 Batch 训练
     model = None
-    loss_history = []
-    evals_result = {}  # 在循环外部定义，用于累积所有年份的评估结果
+    model_save_path = Path(Config.OUTPUT_DIR) / 'models' / f'lgb_end_{target_end_year}.txt'
+    model_save_path.parent.mkdir(parents=True, exist_ok=True)
+    params = Config.LGBM_PARAMS_GPU if use_gpu else Config.LGBM_PARAMS
+    evals_result = {}
 
-    pbar = tqdm(train_years, desc="Training Years")
+    for i, batch in enumerate(batches):
+        print(f"\n{'='*60}")
+        print(f"🏃 Training {batch['name']} ({i+1}/{len(batches)})")
 
-    for year in pbar:
-        pbar.set_description(f"Training {year}")
+        # 【内存优化 B】逐年加载并转 Numpy，不进行 Pandas Concat
+        train_arrays = []
+        train_labels = []
+        total_rows = 0
 
-        # A. 加载当年数据
-        df_train = get_year_data(year, global_features, hard_candidates, CURRENT_NEG_RATE, is_training=True)
+        for yr in batch['train_years']:
+            print(f"  📖 Loading Year {yr}...")
+            df = get_year_data(yr, pipeline, hard_candidates, mode='train')
+            if df is None or df.empty: continue
+            
+            # 补齐列
+            for col in feature_cols:
+                if col not in df.columns: df[col] = 0
+            
+            # 立即转为 float32 numpy array
+            # 这步是关键：防止 int 和 float 混合导致 concat 后变成 float64
+            arr = df[feature_cols].values.astype(np.float32)
+            lbl = df['Label'].values.astype(np.float32)
+            
+            train_arrays.append(arr)
+            train_labels.append(lbl)
+            total_rows += len(arr)
+            
+            # 立即释放 DataFrame
+            del df
+            gc.collect()
 
-        if df_train is None:
+        if total_rows == 0:
+            print("  ⚠️ 跳过空Batch")
             continue
 
-        # B. 构造 Dataset
-        train_ds = lgb.Dataset(
-            df_train[feature_cols],
-            label=df_train['Label'],
-            free_raw_data=True
-        )
+        print(f"  ⚡ Merging into single Float32 matrix ({total_rows:,} rows)...")
+        # 使用 numpy vstack (比 pandas concat 省内存且类型可控)
+        X_train = np.vstack(train_arrays)
+        y_train = np.concatenate(train_labels)
 
-        # C. 训练 (使用回调记录评估结果)
-        model = lgb.train(
-            params,
-            train_set=train_ds,
-            valid_sets=[val_data],
-            valid_names=['val'],
-            init_model=model,
-            keep_training_booster=True,
-            callbacks=[
-                lgb.log_evaluation(period=0),
-                lgb.record_evaluation(evals_result)  # 记录到 evals_result 字典
-            ]
-        )
-
-        # 从字典里读取验证集损失
-        if 'val' in evals_result and 'binary_logloss' in evals_result['val']:
-            current_loss = evals_result['val']['binary_logloss'][-1]
-            loss_history.append(current_loss)
-            pbar.set_postfix({'val_loss': f"{current_loss:.4f}"})
-
-        del df_train, train_ds
+        # 释放临时列表
+        del train_arrays, train_labels
         gc.collect()
 
-    # 5. 保存最终模型
-    print("\nStep 5: 保存最终模型...")
-    output_path = Path(Config.OUTPUT_DIR) / 'fast_model.txt'
-    model.save_model(str(output_path))
-    print(f"✓ 模型已保存至: {output_path}")
-    
-    # 绘制 Loss 曲线
-    if loss_history:
-        plt.figure(figsize=(10, 5))
-        plt.plot(train_years, loss_history, marker='o')
-        plt.title(f'Incremental Training Loss (End Year: {train_years[-1]})')
-        plt.xlabel('Year')
-        plt.ylabel('Validation LogLoss')
-        plt.grid(True)
-        plt.savefig(Path(Config.OUTPUT_DIR) / 'fast_training_history.png')
-        print("✓ 训练历史图表已保存")
+        # 【修正】定义类别特征列表 (LightGBM 需要知道哪些列是类别)
+        # 注意：这里使用的是特征名，必须确保这些列在 feature_cols 中
+        categorical_feats = ['From_City', 'is_same_province']
+        # 确保只包含存在的列
+        categorical_feats = [c for c in categorical_feats if c in feature_cols]
+
+        print(f"  📦 Constructing LGBM Dataset (Categorical: {categorical_feats})...")
+        # 【修正】显式传入 feature_name 和 categorical_feature
+        train_ds = lgb.Dataset(
+            X_train,
+            label=y_train,
+            feature_name=feature_cols,        # 关键：传入特征名列表
+            categorical_feature=categorical_feats, # 关键：指定类别特征
+            free_raw_data=True
+        )
+        
+        # 立即释放巨大的 Numpy 数组
+        del X_train, y_train
+        gc.collect()
+
+        # 训练
+        print(f"  🔥 Fitting model...")
+        model = lgb.train(
+            params,
+            train_ds,
+            num_boost_round=params['n_estimators'],
+            valid_sets=[train_ds, val_ds],
+            valid_names=['train', 'val'],
+            init_model=model,
+            callbacks=[
+                lgb.log_evaluation(10),
+                lgb.early_stopping(50),
+                lgb.record_evaluation(evals_result)
+            ]
+        )
+        
+        del train_ds
+        gc.collect()
+
+    if model:
+        model.save_model(str(model_save_path))
+        print(f"\n💾 模型已保存: {model_save_path}")
+
+        # 【新增】打印并保存特征重要性列表
+        print_and_plot_importance(model, target_end_year)
+        plot_history(evals_result, target_end_year)
+
+        # 【快速评估】在测试集上评估
+        print(f"\n{'='*60}")
+        print(f"📈 在测试集 {Config.TEST_YEARS} 上快速评估...")
+
+        # 初始化评估上下文
+        ctx = EvalContext()
+        # 加载刚才训练好的模型
+        ctx.load_resources(model_save_path)
+
+        # 评估配置中定义的测试年份 (通常是 target_end_year - 1 或 target_end_year)
+        # 这里为了演示，我们评估 target_end_year 这一年
+        # 注意：cache_dir 指向训练生成的数据目录
+        CACHE_DIR = Path(Config.OUTPUT_DIR) / 'cache'
+
+        # 使用 evaluate_year (这是 evaluate.py 中的主函数)
+        evaluate_year(target_end_year, ctx, sample_size=50000, cache_dir=CACHE_DIR)
+
+def print_and_plot_importance(model, year):
+    """
+    【新增】打印文本版特征重要性并保存图表
+    """
+    # 1. 获取特征重要性
+    importance = model.feature_importance(importance_type='gain')
+    names = model.feature_name()
+
+    # 2. 构建 DataFrame
+    df_imp = pd.DataFrame({'feature': names, 'gain': importance})
+    df_imp = df_imp.sort_values(by='gain', ascending=False).reset_index(drop=True)
+
+    # 3. 打印 Top 20 到控制台
+    print(f"\n📊 Feature Importance (Top 20) - End {year}")
+    print("-" * 60)
+    print(f"{'Rank':<5} {'Feature':<30} {'Gain':<15} {'Share':<10}")
+    print("-" * 60)
+    total_gain = df_imp['gain'].sum()
+    for i, row in df_imp.head(20).iterrows():
+        share = row['gain'] / total_gain
+        print(f"{i+1:<5} {row['feature']:<30} {row['gain']:.2f}          {share:.1%}")
+    print("-" * 60)
+
+    # 4. 画图 (带名字)
+    print("\n📊 生成特征重要性图表...")
+    plt.figure(figsize=(12, 10))
+    lgb.plot_importance(model, max_num_features=30, importance_type='gain',
+                        height=0.5, title=f'Feature Importance (Gain) - End {year}', grid=False)
+    plt.tight_layout()
+    plt.savefig(Path(Config.OUTPUT_DIR) / f'feature_importance_{year}.png')
+
+def plot_feature_importance(model, year):
+    # (保持不变，已废弃)
+    print("\n📊 生成特征重要性图表...")
+    plt.figure(figsize=(12, 10))
+    lgb.plot_importance(model, max_num_features=30, importance_type='gain',
+                        height=0.5, title=f'Feature Importance (Gain) - End {year}', grid=False)
+    plt.tight_layout()
+    plt.savefig(Path(Config.OUTPUT_DIR) / f'feature_importance_{year}.png')
+
+def plot_history(evals, year):
+    # (保持不变)
+    if not evals: return
+    plt.figure(figsize=(10, 6))
+    for k in ['binary_logloss', 'auc']:
+        if k in evals.get('train', {}):
+            plt.plot(evals['train'][k], label=f'Train {k}')
+        if k in evals.get('val', {}):
+            plt.plot(evals['val'][k], label=f'Val {k}')
+    plt.title(f'Training Metrics - End {year}')
+    plt.legend()
+    plt.savefig(Path(Config.OUTPUT_DIR) / f'training_history_{year}.png')
 
 if __name__ == "__main__":
-    import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--end_year', type=int, default=None)
+    parser.add_argument('--end_year', type=int, default=2012)
     parser.add_argument('--gpu', action='store_true')
     args = parser.parse_args()
 
-    fast_train(end_year=args.end_year, use_gpu=args.gpu)
+    train_dynamic(args.end_year, args.gpu)

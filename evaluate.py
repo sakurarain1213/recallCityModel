@@ -68,16 +68,17 @@ def evaluate_year(year, ctx, sample_size=None, cache_dir='output/cache'):
     
     # 1. 获取 Ground Truth (真实流向)
     # 使用 load_raw_data_fast 获取原始正样本
-    # neg_sample_rate 设为 1 即可，因为我们只筛选正样本
+    # 【优化】neg_sample_rate=0 表示不生成任何额外的负样本，只返回原始的正样本 (Rank 1-20)
     print("Step 1: 加载测试集 Ground Truth...")
-    df_raw = load_raw_data_fast(Config.DB_PATH, year, hard_candidates=[], neg_sample_rate=1)
+    df_raw = load_raw_data_fast(Config.DB_PATH, year, hard_candidates=[], neg_sample_rate=0)
     
     if df_raw.empty:
         print("❌ 该年份无数据")
         return None
 
-    # 筛选正样本 (Label > 0 表示它是真实存在的流向，包括 Rank 1-20)
-    df_pos = df_raw[df_raw['Label'] > 0].copy()
+    # 再次过滤，确保只要 Rank <= 20 的作为 GT
+    # 我们这里只要 Rank <= 20 的作为 GT
+    df_pos = df_raw[df_raw['Rank'] <= 20].copy()
     
     # 提取唯一的 Queries (Year, Type, From)
     queries = df_pos[['Year', 'Type_ID', 'From_City']].drop_duplicates().reset_index(drop=True)
@@ -288,21 +289,47 @@ def predict_one(year, type_id, from_city, ctx):
     print(f"{'Rank':<5} {'City ID':<10} {'Name':<15} {'Score':<10}")
     print("-" * 45)
     for i, (idx, row) in enumerate(top10.iterrows(), 1):
-        city_id = int(row['To_City'])
-        name = city_map.get(city_id, "Unknown")
-        print(f"{i:<5} {city_id:<10} {name:<15} {row['score']:.4f}")
+        # 【修正】强制转为 int 再查表
+        city_id_val = int(row['To_City'])
+
+        # 安全查表逻辑
+        # 确保 city_map 的 key 也是 int
+        # 假设 loader.get_city_id_to_name() 返回的是 {1301: '石家庄'}
+        # 如果 key 是 string，则用 str(city_id_val)
+        name = city_map.get(city_id_val, city_map.get(str(city_id_val), "Unknown"))
+
+        print(f"{i:<5} {city_id_val:<10} {name:<15} {row['score']:.4f}")
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--year', type=int, default=2010, help="评估年份")
-    parser.add_argument('--sample', type=int, default=1000, help="采样Query数，0为全量")
+    parser.add_argument('--sample', type=int, default=50000, help="采样Query数，0为全量")
+    parser.add_argument('--model', type=str, default=None, help="模型文件路径 (默认自动查找最新)")
     parser.add_argument('--predict', action='store_true', help="运行单次推理演示")
     args = parser.parse_args()
     
     # 初始化上下文
     ctx = EvalContext()
-    model_path = Path(Config.OUTPUT_DIR) / 'fast_model.txt'
+
+    # 【快速评估】使用刚训练好的模型
+    # 如果未指定 --model 参数，默认使用最新的 lgb_end_2012.txt
+    if args.model:
+        model_path = Path(args.model)
+    else:
+        # 自动查找最新的 end_year 模型
+        model_dir = Path(Config.OUTPUT_DIR) / 'models'
+        if model_dir.exists():
+            # 查找所有 lgb_end_*.txt 文件
+            models = list(model_dir.glob('lgb_end_*.txt'))
+            if models:
+                # 按修改时间排序，取最新的
+                model_path = max(models, key=lambda p: p.stat().st_mtime)
+                print(f"✓ 自动检测到最新模型: {model_path}")
+            else:
+                model_path = Path(Config.OUTPUT_DIR) / 'fast_model.txt'
+        else:
+            model_path = Path(Config.OUTPUT_DIR) / 'fast_model.txt'
     
     if not model_path.exists():
         print(f"❌ 未找到模型文件: {model_path}")

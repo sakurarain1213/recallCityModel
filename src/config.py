@@ -16,99 +16,83 @@ class Config:
     # 训练参数
     SEED = 42
 
-    # 【召回模式】负样本采样率：混合采样策略
-    # 策略：50个困难负样本（大城市）+ 50个随机负样本（任意城市）
-    # 结果：每个Query有 20个正样本(Top1-20) + 100个混合负样本 = 120条数据
-    # 目的：增加负样本数量，提高模型在更多干扰项下的区分能力，提升Recall@10
-    NEG_SAMPLE_RATE = 100  # 从60提升到100，负样本比例从1:3提升到1:5
+    # 【User Req 5】负样本目标数量
+    NEG_SAMPLE_RATE = 40  # 1个正样本 : 40个负样本 (Top10正样本共10个，所以比例约 1:4)
 
-    # 数据集划分（21年数据：2000-2020）
-    # 2000年仅用于提供历史特征，不参与训练
-    # 训练集：2001-2017 (17年)
-    # 验证集：2018 (1年)
-    # 测试集：2019-2020 (2年)
-    DATA_START_YEAR = 2000  # 从2000年开始处理（用于历史特征）
+    # 【User Req 5】全局热门城市 (Hard Global Negatives)
+    # 这些城市如果在Ground Truth Top10之外，就是极强的干扰项
+    # 包含: 北上广深 + 成都/杭州/重庆/武汉/西安/苏州/南京/天津/郑州/长沙/东莞/佛山
+    POPULAR_CITIES = [
+        1100, 3100, 4401, 4403,  # 一线
+        5101, 3301, 5000, 4201, 6101, 3205, 3201, 1200, 4101, 4301, 4419, 4406 # 新一线
+    ]
+
+    # 数据集划分
+    DATA_START_YEAR = 2000
+
+    # 【分批训练策略】三年一个 Batch，适应 14GB 内存限制
+    # 每批使用 3 年训练数据，内存需求约 8-10GB ✅
+    #
+    # Batch 划分:
+    #   Batch 1: 训练 2001-2003，验证 2008
+    #   Batch 2: 训练 2004-2006，验证 2009
+    #   Batch 3: 训练 2007，验证 2010
+    #   最终测试: 2010
+    #
+    # 优势:
+    #   1. 时间顺序训练，更符合实际预测场景
+    #   2. 每批内存占用可控（~8-10GB）
+    #   3. 充分利用历史数据，避免浪费
+    TRAIN_BATCHES = [
+        {
+            'name': 'batch1_2001-2003',
+            'train_years': [2001, 2002, 2003],
+            'val_year': 2008
+        },
+        {
+            'name': 'batch2_2004-2006',
+            'train_years': [2004, 2005, 2006],
+            'val_year': 2009
+        },
+        {
+            'name': 'batch3_2007',
+            'train_years': [2007],
+            'val_year': 2010
+        }
+    ]
+
+    # 最终测试年份
+    TEST_YEARS = [2010]
+
+    # 向后兼容的旧配置（用于单批训练）
     TRAIN_START_YEAR = 2001
-    TRAIN_END_YEAR = 2017
-    VAL_YEARS = [2018]
-    TEST_YEARS = [2019, 2020]
+    TRAIN_END_YEAR = 2003
+    VAL_YEARS = [2008]
 
-    # LGBM 参数（二分类模式：Top 10 = 1，其他 = 0）
+    # 【User Req 3】模型参数调整 (增加深度，处理非线性)
     LGBM_PARAMS = {
-        'objective': 'binary',          # 改为二分类
-        'metric': 'binary_logloss',     # 监控 LogLoss
+        'objective': 'binary',
+        'metric': ['binary_logloss', 'auc'],
         'boosting_type': 'gbdt',
-        'n_estimators': 1000,
-        'learning_rate': 0.1,
-
-        # 【优化】增加叶子节点数，让树更深，捕捉复杂关系
-        'num_leaves': 63,
-
-        'max_depth': -1,
-
-        # 【修复】从 10 改为 100，对于千万级数据，叶子节点至少要有几百个样本才具有统计意义
-        'min_child_samples': 100,
-
+        'n_estimators': 3000,     # 增加树数量
+        'learning_rate': 0.03,    # 降低学习率以适应Batch训练
+        'num_leaves': 255,        # 【User Req 3】大幅增加叶子节点 (原本127)
+        'max_depth': 12,          # 【User Req 3】限制深度防止过拟合 (配合num_leaves)
+        'min_child_samples': 50,
         'subsample': 0.8,
-
-        # 【优化】特征采样率 0.8，每次只看 80% 特征，强迫模型使用更多特征
-        'colsample_bytree': 0.8,
-
-        # 【优化】增加 L1/L2 正则化，防止过拟合单一特征
+        'colsample_bytree': 0.7,
         'lambda_l1': 0.5,
         'lambda_l2': 0.5,
-
-        # 【新增】增加 Hessian 阈值，防止在弱信号上强行分裂
-        'min_sum_hessian_in_leaf': 0.001,
-
-        'random_state': 42,
         'n_jobs': -1,
-        'verbosity': -1,  # 减少警告输出
+        'verbosity': -1,
+        'first_metric_only': True
     }
 
-    # 第二套！  GPU 训练参数（需要安装 lightgbm-gpu 版本）
-    LGBM_PARAMS_GPU = {
-        'objective': 'binary',
-        'metric': 'binary_logloss',
-        'boosting_type': 'gbdt',
-
-        # 基础参数
-        'n_estimators': 3000,
-        'learning_rate': 0.1,
-        'random_state': 42,
-        'verbosity': 1,
-
-        # GPU 特定配置
+    # GPU 参数
+    LGBM_PARAMS_GPU = LGBM_PARAMS.copy()
+    LGBM_PARAMS_GPU.update({
         'device': 'gpu',
         'gpu_platform_id': 0,
         'gpu_device_id': 0,
-
-        # 【核心修复 1】开启双精度 (Double Precision)
-        # 单精度(False)会导致直方图计算误差，引发 left_count > 0 崩溃
-        # 虽然会慢一点点，但这是 RTX 显卡跑 OpenCL 的唯一稳定解
         'gpu_use_dp': True,
-
-        # 【核心修复 2】降低直方图箱数 (Max Bin)
-        # 默认 255 在 GPU 上容易出现空箱子，降到 63 可以显著提升稳定性
-        'max_bin': 63,
-
-        # 树结构参数 (保守设置)
-        'num_leaves': 31,       # 保持适中
-        'max_depth': -1,        # 让 num_leaves 控制
-        'min_child_samples': 50,# 恢复到 50，20 太敏感，1000 太难满足
-        'min_child_weight': 0.001,
-
-        # 采样与特征
-        'subsample': 0.8,
-        'subsample_freq': 1,
-        'colsample_bytree': 0.8, # 每次只用 80% 特征
-
-        # 正则化 (适度)
-        'lambda_l1': 2.0,
-        'lambda_l2': 2.0,
-        'min_gain_to_split': 0.0,
-        'min_sum_hessian_in_leaf': 0.001,
-
-        # 强制列式直方图 (通常更稳)
-        'force_col_wise': True,
-    }
+    })
