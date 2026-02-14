@@ -77,7 +77,12 @@ class Config:
     LGBM_PARAMS = {
         'objective': 'binary',
         'metric': ['binary_logloss', 'auc'],
-        'boosting_type': 'gbdt',
+
+        # 【核心修改 1】切换为 GOSS (亿级数据提速神器)
+        'boosting_type': 'goss',
+        'top_rate': 0.2,      # 保留梯度最大的 20% 样本
+        'other_rate': 0.1,    # 从剩余样本中随机采样 10%
+        # 结果：相当于只用 30% 的数据量训练，但保留了核心信息
 
         # 【速度优化核心 1】大幅减少树的复杂度
         # Recall 任务不需要拟合太细的残差，63 叶子 + 8 深足够区分 Top10 和 Top100
@@ -86,21 +91,24 @@ class Config:
 
         # 【速度优化核心 2】CPU 训练的神器：减少分桶
         # 默认 255，降为 63 可提升 3-5 倍速度，精度损失极小
-        'max_bin': 63,
+        'max_bin': 63,            # 必须确认是 63
 
-        # 【速度优化核心 3】增加学习率，减少树数量
-        'learning_rate': 0.05,    # 原 0.03 -> 0.05
-        'n_estimators': 2000,     # 原 3000 -> 2000 (配合早停)
+        # 【速度优化核心 3】提高学习率，减少树数量
+        'learning_rate': 0.1,     # 原 0.05 -> 0.1 (加速收敛)
+        'n_estimators': 1000,      # 原 2000 -> 1000 (配合早停)
 
-        # 采样与正则化
-        'subsample': 0.8,         # 行采样
-        'subsample_freq': 5,      # 每5轮做一次采样
-        'colsample_bytree': 0.8,  # 列采样
+        # 【核心修改 2】GOSS 模式下必须移除 subsample (行采样)
+        # 'subsample': 0.8,         # GOSS 不兼容，注释掉
+        # 'subsample_freq': 5,      # GOSS 不兼容，注释掉
+
+        'colsample_bytree': 0.8,  # 列采样可以保留
         'min_child_samples': 100, # 防止过拟合
         'lambda_l1': 0.1,
         'lambda_l2': 0.1,
 
-        'n_jobs': -1,             # 跑满 CPU
+        # 【关键修改 1】限制线程数，不要用 -1
+        # 建议设置为 16-32 之间，不要超过物理核数
+        'n_jobs': 24,            # 原 -1 -> 24 (避免过度竞争)
         'verbosity': -1
     }
 
