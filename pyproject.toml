@@ -13,4 +13,5 @@ dependencies = [
     "lightgbm",
     "scikit-learn",
     "matplotlib",
+    "seaborn>=0.13.2",
 ]

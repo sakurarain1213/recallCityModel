@@ -1,3 +1,13 @@
+
+```
+uv run generate_data.py
+uv run fast_train.py --end_year 2020
+uv run evaluate.py --year 2020 --sample 10000
+uv run evaluate.py --year 2020 --model output/checkpoints/model_2020_round_50.txt --sample 5000
+```
+
+
+
 ```
 服务器版本
 本地： ssh -p 2023 -R 10080:127.0.0.1:7890 -N wxj@10.82.1.210

@@ -107,74 +107,74 @@ def parse_type_id(df, verbose=True):
 
 def extract_city_id(val):
     """
-    提取城市ID（处理可能的格式：1100, "1100", "北京(1100)"）
+    鲁棒的城市ID提取：
+    支持 "1100", 1100, "北京(1100)"
+    返回整数类型
     """
     if pd.isna(val):
-        return None
-    val_str = str(val).strip()
-    # 如果是空字符串，返回 None
-    if not val_str:
-        return None
-    # 如果是 "北京(1100)" 格式，提取括号内的数字
-    if '(' in val_str and ')' in val_str:
-        match = re.search(r'\((\d+)\)', val_str)
-        if match:
-            return match.group(1)
-    # 否则直接返回字符串形式
-    return val_str
+        return 0
+    s = str(val).strip()
+    if not s:
+        return 0
+
+    # 情况1: 纯数字字符串 "1100" 或数字 1100
+    if s.isdigit():
+        return int(s)
+
+    # 情况2: 带括号 "北京(1100)"
+    match = re.search(r'\((\d+)\)', s)
+    if match:
+        return int(match.group(1))
+
+    # 情况3: 尝试直接提取数字
+    match_all = re.findall(r'\d+', s)
+    if match_all:
+        return int(match_all[-1])  # 通常ID在最后
+
+    return 0
 
 
 def add_cross_features(df, city_nodes, city_edges, verbose=True):
     """
-    添加城市特征（极简版）：
-    1. From_City 保留为分类特征（337个城市，一个维度）
-    2. From 和 To 城市的属性差异 ratio（21个属性）
-    3. 地理距离和方言距离
-
-    注意：保留原始 From_City 列作为 From_City_orig，用于历史特征匹配
+    修复版：确保基于 INT 类型的 Merge
     """
     if verbose:
-        print("Generating City features (minimal version)...")
+        print("Generating City features (Int Merge Fixed)...")
 
-    # 【关键】保留原始 From_City 列，用于历史特征匹配
+    # 1. 确保 From/To 是 Int 类型
     if 'From_City' in df.columns:
-        # 提取并清洗城市ID
-        df['From_City_orig'] = df['From_City'].apply(extract_city_id)
-        # 【优化】From_City 转换为 int16（城市 ID 是 4 位数）
-        if verbose:
-            print("  - Converting From_City to int16...")
-        df['From_City'] = df['From_City_orig'].astype(str).astype('int16')
+        # 如果 From_City 还是原始字符串（如 "北京(1100)"），先清洗
+        if df['From_City'].dtype == 'object':
+             df['From_City'] = df['From_City'].apply(extract_city_id)
+        df['From_City'] = df['From_City'].fillna(0).astype('int16')
 
-    # 【优化】清洗 To_City（已经在 data_loader 中转换为 int16）
+    # 保留 orig 用于历史特征 (如果是 int 也无所谓)
+    if 'From_City_orig' not in df.columns:
+        df['From_City_orig'] = df['From_City']
+
     if 'To_City' in df.columns:
-        # To_City 可能已经是 int16，需要先转为 str 再提取 ID
-        df['To_City'] = df['To_City'].apply(lambda x: extract_city_id(x) if not isinstance(x, (int, np.integer)) else str(x)).astype('int16')
+        if df['To_City'].dtype == 'object':
+             df['To_City'] = df['To_City'].apply(extract_city_id)
+        df['To_City'] = df['To_City'].fillna(0).astype('int16')
 
-    # 1. 添加边特征 (距离信息)
+    # 2. 添加边特征 (距离)
     if verbose:
         print("  - Adding edge features (geo distance, dialect distance)...")
 
     if not city_edges.empty:
-        # 需要使用原始的 From_City_orig 进行 merge
+        # CityDataLoader 已经把 city_edges 的 ID 转为 int 了，直接 Merge
         edge_lookup = city_edges[['source_id', 'target_id', 'w_geo', 'w_dialect']].copy()
-        edge_lookup.columns = ['From_City_orig', 'To_City', 'geo_distance', 'dialect_distance']
+        edge_lookup.columns = ['From_City', 'To_City', 'geo_distance', 'dialect_distance']  # 改名以便 Merge
 
-        # 【关键修复】强制两边都转为 string 类型，防止 int vs str 导致匹配失败
-        df['From_City_orig'] = df['From_City_orig'].astype(str)
-        df['To_City'] = df['To_City'].astype(str)
-        edge_lookup['From_City_orig'] = edge_lookup['From_City_orig'].astype(str)
-        edge_lookup['To_City'] = edge_lookup['To_City'].astype(str)
+        # 强制类型一致
+        edge_lookup['From_City'] = edge_lookup['From_City'].astype('int16')
+        edge_lookup['To_City'] = edge_lookup['To_City'].astype('int16')
 
-        df = df.merge(
-            edge_lookup,
-            on=['From_City_orig', 'To_City'],
-            how='left'
-        )
+        df = df.merge(edge_lookup, on=['From_City', 'To_City'], how='left')
 
-        # 【调试输出】打印匹配率
         if verbose:
-            match_rate = (df['geo_distance'].notna()).mean()
-            print(f"    > Edge Match Rate: {match_rate:.2%}")
+            hit_rate = df['geo_distance'].notna().mean()
+            print(f"    > Edge Match Rate (Distance): {hit_rate:.2%} (Expect > 90%)")
 
         df['geo_distance'] = df['geo_distance'].fillna(-1).astype('float32')
         df['dialect_distance'] = df['dialect_distance'].fillna(-1).astype('float32')
@@ -182,109 +182,56 @@ def add_cross_features(df, city_nodes, city_edges, verbose=True):
         df['geo_distance'] = -1.0
         df['dialect_distance'] = -1.0
 
-    # === 在这里插入新特征 ===
+    # 3. 添加 is_same_province
     if verbose:
         print("  - Adding logic features (is_same_province)...")
 
-    # 计算省份ID (前两位)
-    # 确保是 int 类型
     f_prov = df['From_City'].astype(int) // 100
     t_prov = df['To_City'].astype(int) // 100
-
-    # 同省为1，不同省为0
     df['is_same_province'] = (f_prov == t_prov).astype('int8')
 
-    # 2. 计算 From 和 To 城市的属性差异 ratio（不添加绝对属性）
+    # 4. 计算 Ratio 特征
     if verbose:
         print("  - Calculating From-To attribute ratios...")
 
-    if not city_nodes.empty:
-        # 定义要使用的城市属性（从 city_info 中提取）
-        city_attrs = [
-            'tier', 'area_sqkm', 'gdp_per_capita', 'cpi_index', 'unemployment_rate',
-            'agriculture_share', 'agriculture_wage',
-            'manufacturing_share', 'manufacturing_wage',
-            'traditional_services_share', 'traditional_services_wage',
-            'modern_services_share', 'modern_services_wage',
-            'housing_price_avg', 'rent_avg', 'daily_cost_index',
-            'medical_score', 'education_score', 'transport_convenience', 'avg_commute_mins',
-            'population_total'
-        ]
+    if city_nodes is not None and not city_nodes.empty:
+        # city_nodes 的索引是 city_id (Int)
 
-        available_attrs = [attr for attr in city_attrs if attr in city_nodes.columns]
+        # 选取数值列
+        num_cols = city_nodes.select_dtypes(include=[np.number]).columns.tolist()
+        city_data = city_nodes[num_cols].copy()
 
-        if available_attrs:
-            # 重置索引，将 city_id 从索引变为列
-            city_data = city_nodes.reset_index()[['city_id'] + available_attrs].copy()
+        # Merge From
+        df = df.merge(city_data.add_prefix('from_'), left_on='From_City', right_index=True, how='left')
 
-            # 【关键修复】强制转换为 string 类型
-            city_data['city_id'] = city_data['city_id'].astype(str)
+        # Merge To
+        df = df.merge(city_data.add_prefix('to_'), left_on='To_City', right_index=True, how='left')
 
-            # Merge From_City 属性（临时使用）
-            df = df.merge(
-                city_data.add_prefix('from_'),
-                left_on='From_City_orig',
-                right_on='from_city_id',
-                how='left'
-            )
+        if verbose:
+            print(f"    > Node Match Rate: {df['from_gdp_per_capita'].notna().mean():.2%}")
 
-            # 【调试输出】打印匹配率
-            if verbose:
-                from_match_rate = (df['from_tier'].notna()).mean() if 'from_tier' in df.columns else 0
-                print(f"    > From_City Match Rate: {from_match_rate:.2%}")
+        # 计算比值
+        for col in num_cols:
+            from_col = f'from_{col}'
+            to_col = f'to_{col}'
 
-            # Merge To_City 属性（临时使用）
-            df = df.merge(
-                city_data.add_prefix('to_'),
-                left_on='To_City',
-                right_on='to_city_id',
-                how='left'
-            )
+            # 简单的处理：如果缺少数据，ratio = 1
+            # 加上平滑项防止除零
+            val_from = df[from_col].fillna(0)
+            val_to = df[to_col].fillna(0)
 
-            # 【调试输出】打印匹配率
-            if verbose:
-                to_match_rate = (df['to_tier'].notna()).mean() if 'to_tier' in df.columns else 0
-                print(f"    > To_City Match Rate: {to_match_rate:.2%}")
+            ratio = np.where(val_from > 1e-5, val_to / (val_from + 1e-5), 1.0)
+            ratio = np.clip(ratio, 0.1, 10.0)  # 截断极端值
 
-            # 计算 ratio 特征（To / From）
-            for attr in available_attrs:
-                from_col = f'from_{attr}'
-                to_col = f'to_{attr}'
+            df[f'{col}_ratio'] = ratio.astype('float32')
 
-                if from_col in df.columns and to_col in df.columns:
-                    # 【修改点 1】加上平滑项，防止除以 0
-                    # 【修改点 2】使用截断（Clipping），防止极端值
-                    # 原始代码:
-                    # df[f'{attr}_ratio'] = np.where(df[from_col] != 0, df[to_col] / df[from_col], 1.0)
+        # 删除原始绝对值列，只保留 ratio (或者你可以选择保留几项重要的绝对值，比如 GDP)
+        drop_cols = [c for c in df.columns if c.startswith('from_') or c.startswith('to_')]
+        df.drop(columns=drop_cols, inplace=True)
 
-                    # === 新代码 Start ===
-                    # 1. 先计算原始比值，并处理除零异常
-                    raw_ratio = np.where(
-                        df[from_col] > 1e-6,  # 避免除以极小值
-                        df[to_col] / (df[from_col] + 1e-6),  # 分母加平滑项
-                        1.0
-                    )
-
-                    # 2. 【关键】强制截断 (Clipping)
-                    # 将比值限制在 [0.1, 10] 范围内，防止出现 1000 倍的极端差异
-                    # 经济指标差异超过 10 倍通常是异常或量纲错误
-                    clipped_ratio = np.clip(raw_ratio, 0.1, 10.0)
-
-                    df[f'{attr}_ratio'] = clipped_ratio.astype('float32')
-                    # === 新代码 End ===
-
-            # 删除临时的 from_* 和 to_* 列
-            cols_to_drop = [f'from_{attr}' for attr in available_attrs] + \
-                          [f'to_{attr}' for attr in available_attrs] + \
-                          ['from_city_id', 'to_city_id']
-            df = df.drop(cols_to_drop, axis=1, errors='ignore')
-
-            if verbose:
-                feature_count = len(available_attrs) + 2 + 1 + 1  # ratio + 2 distances + From_City + is_same_province
-                print(f"  - Generated {feature_count} city features (From_City as int + {len(available_attrs)} ratios + 2 distances + is_same_province)")
-        else:
-            if verbose:
-                print("  - Warning: No city attributes found")
+        if verbose:
+            feature_count = len(num_cols) + 2 + 1  # ratio + 2 distances + is_same_province
+            print(f"  - Generated {feature_count} city features ({len(num_cols)} ratios + 2 distances + is_same_province)")
     else:
         if verbose:
             print("  - Warning: city_nodes is empty")

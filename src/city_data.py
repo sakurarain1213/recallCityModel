@@ -18,6 +18,13 @@ class CityDataLoader:
         self.city_nodes = None
         self.city_ids = None
 
+    def _safe_int(self, val):
+        """辅助函数:安全转换为int"""
+        try:
+            return int(val)
+        except:
+            return -1
+
     def load_all(self, year=None):
         """
         加载所有城市数据
@@ -63,8 +70,11 @@ class CityDataLoader:
             # 展平嵌套的 JSON 结构
             flattened_data = []
             for item in data:
+                # 产业结构安全获取
+                sectors = item['economy'].get('industry_sectors', {})
+
                 flat_item = {
-                    'city_id': item['city_id'],
+                    'city_id': self._safe_int(item['city_id']),  # 强制转 Int
                     'city_name': item['city_name'],
                     # 基本信息
                     'tier': item['basic_info']['tier'],
@@ -73,15 +83,15 @@ class CityDataLoader:
                     'gdp_per_capita': item['economy']['gdp_per_capita'],
                     'cpi_index': item['economy']['cpi_index'],
                     'unemployment_rate': item['economy']['unemployment_rate'],
-                    # 产业结构
-                    'agriculture_share': item['economy']['industry_sectors']['agriculture']['share'],
-                    'agriculture_wage': item['economy']['industry_sectors']['agriculture']['avg_wage'],
-                    'manufacturing_share': item['economy']['industry_sectors']['manufacturing']['share'],
-                    'manufacturing_wage': item['economy']['industry_sectors']['manufacturing']['avg_wage'],
-                    'traditional_services_share': item['economy']['industry_sectors']['traditional_services']['share'],
-                    'traditional_services_wage': item['economy']['industry_sectors']['traditional_services']['avg_wage'],
-                    'modern_services_share': item['economy']['industry_sectors']['modern_services']['share'],
-                    'modern_services_wage': item['economy']['industry_sectors']['modern_services']['avg_wage'],
+                    # 产业结构（使用安全获取）
+                    'agriculture_share': sectors.get('agriculture', {}).get('share', 0),
+                    'agriculture_wage': sectors.get('agriculture', {}).get('avg_wage', 0),
+                    'manufacturing_share': sectors.get('manufacturing', {}).get('share', 0),
+                    'manufacturing_wage': sectors.get('manufacturing', {}).get('avg_wage', 0),
+                    'traditional_services_share': sectors.get('traditional_services', {}).get('share', 0),
+                    'traditional_services_wage': sectors.get('traditional_services', {}).get('avg_wage', 0),
+                    'modern_services_share': sectors.get('modern_services', {}).get('share', 0),
+                    'modern_services_wage': sectors.get('modern_services', {}).get('avg_wage', 0),
                     # 生活成本
                     'housing_price_avg': item['living_cost']['housing_price_avg'],
                     'rent_avg': item['living_cost']['rent_avg'],
@@ -97,6 +107,8 @@ class CityDataLoader:
                 flattened_data.append(flat_item)
 
             df = pd.DataFrame(flattened_data)
+            # 确保索引是 Int
+            df['city_id'] = df['city_id'].astype(int)
             df.set_index('city_id', inplace=True)
             self.city_info[yr] = df
             print(f"Loaded {len(df)} cities info for year {yr}")
@@ -133,13 +145,16 @@ class CityDataLoader:
             for line in f:
                 edge = json.loads(line)
                 data.append({
-                    'source_id': edge['source_id'],
-                    'target_id': edge['target_id'],
+                    'source_id': self._safe_int(edge['source_id']),  # 强制转 Int
+                    'target_id': self._safe_int(edge['target_id']),  # 强制转 Int
                     'w_geo': edge['w_geo'],
                     'w_dialect': edge['w_dialect'],
                 })
 
         self.city_edges = pd.DataFrame(data)
+        # 确保列类型为 Int
+        self.city_edges['source_id'] = self.city_edges['source_id'].astype(int)
+        self.city_edges['target_id'] = self.city_edges['target_id'].astype(int)
         print(f"Loaded {len(self.city_edges)} city edges")
         return self
 
@@ -162,12 +177,16 @@ class CityDataLoader:
             for line in f:
                 node = json.loads(line)
                 data.append({
-                    'city_id': node['city_id'],
+                    'city_id': self._safe_int(node['city_id']),  # 强制转 Int
                     'city_name': node['name'],
                 })
 
         self.city_nodes = pd.DataFrame(data)
-        self.city_ids = self.city_nodes['city_id'].tolist()
+        if not self.city_nodes.empty:
+            self.city_nodes['city_id'] = self.city_nodes['city_id'].astype(int)
+            self.city_ids = self.city_nodes['city_id'].tolist()  # 这里输出的就是 Int List 了
+        else:
+            self.city_ids = []
         print(f"Loaded {len(self.city_nodes)} city nodes")
         return self
 
