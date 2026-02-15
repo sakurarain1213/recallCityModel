@@ -190,7 +190,8 @@ def train_batch_mode(target_end_year, batch_size_years=3, checkpoint_freq=50):
         try:
             # 回调列表
             callbacks_list = [
-                lgb.early_stopping(stopping_rounds=20, verbose=True),
+                # 核心早停参数 修改后：增加耐心到 50 或 100，或者直接注释掉，让它跑满 1000 轮
+                lgb.early_stopping(stopping_rounds=100, verbose=True),
                 lgb.log_evaluation(50), # 减少打印频率到 50
                 # 添加 Checkpoint 回调
                 save_checkpoint_callback(checkpoint_freq, Config.OUTPUT_DIR, target_end_year)

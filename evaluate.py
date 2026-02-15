@@ -22,14 +22,17 @@ from src.feature_eng import extract_city_id  # 复用同一个提取函数
 # ------------------------------------------------------------------------------
 def load_ground_truth(db_path, year):
     """
-    修复版：严格提取 Int 类型的 ID
+    修复版：严格提取 Int 类型的 ID  尤其注意ground truth是 top10 而不是20个都加载进来。
     """
     print(f"📥 Querying DuckDB for year {year}...")
     con = duckdb.connect(str(db_path), read_only=True)
 
     # 查询
-    top_cols = [f"To_Top{i}" for i in range(1, 21)]
+    # 修改后: 只加载 Top 10 作为 Ground Truth
+    # 这样分母(GT总数)就变成了 10，Recall@10 的理论上限就是 100% 了
+    top_cols = [f"To_Top{i}" for i in range(1, 11)] 
     cols_str = ", ".join(top_cols)
+
     query = f"SELECT Year, Type_ID, From_City, {cols_str} FROM migration_data WHERE Year = {year}"
 
     try:
