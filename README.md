@@ -208,7 +208,7 @@ recall/
 │   ├── city_edges.jsonl                     # 城市间距离关系
 │   └── city_nodes.jsonl                     # 城市基本信息
 ├── output/                                   # 输出目录
-│   └── processed_data/                       # 处理后的训练数据
+│   └──processed_ready                      # 有2000-2020预处理后的parquet
 └── src/                                      # 源代码
 ```
 

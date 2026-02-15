@@ -1,361 +1,251 @@
 """
-evaluate.py
-极速评估脚本 - 复用训练缓存，无需额外生成步骤
+极速评估脚本 (宽表适配修复版)
+功能: 加载模型 -> 从宽表 DB 读取并展开 GT -> 构造全量候选集 -> 特征工程 -> 预测 -> 计算 Recall
+修复: 解决了 DuckDB 表结构不匹配的问题 (Rank 列不存在)
 """
-# uv run evaluate.py --year 2010    运行评估（例如评估 2010 年）
-# uv run evaluate.py --year 2010 --predict 运行评估并演示单次推理
 import gc
 import pandas as pd
 import numpy as np
-from pathlib import Path
-from tqdm import tqdm
 import lightgbm as lgb
-import matplotlib.pyplot as plt
-
-# 导入 src 模块
+import duckdb
+import argparse
+import re
+from pathlib import Path
 from src.config import Config
 from src.city_data import CityDataLoader
-from src.data_loader import load_raw_data_fast
-from src.feature_eng import parse_type_id
-from src.historical_features import add_historical_features
+from src.feature_pipeline import FeaturePipeline
 
-# ==============================================================================
-# 全局资源管理
-# ==============================================================================
-class EvalContext:
-    def __init__(self):
-        self.model = None
-        self.global_features = None
-        self.city_ids = None
-        self.feature_cols = None
-
-    def load_resources(self, model_path):
-        print("正在加载评估资源...")
-        
-        # 1. 加载模型
-        try:
-            self.model = lgb.Booster(model_file=str(model_path))
-            self.feature_cols = self.model.feature_name()
-            print(f"✓ 模型已加载，特征数量: {len(self.feature_cols)}")
-        except Exception as e:
-            print(f"❌ 模型加载失败: {e}")
-            raise
-
-        # 2. 加载全局特征表 (与训练时一致)
-        global_feat_path = Path(Config.OUTPUT_DIR) / 'global_city_features.parquet'
-        if not global_feat_path.exists():
-            raise FileNotFoundError(f"未找到全局特征表: {global_feat_path}\n请先运行: python src/precompute_static_features.py")
-        
-        # 读取并优化内存
-        self.global_features = pd.read_parquet(global_feat_path)
-        self.global_features['From_City'] = self.global_features['From_City'].astype('int16')
-        self.global_features['To_City'] = self.global_features['To_City'].astype('int16')
-        
-        # 获取所有目标城市ID (用于构造候选集)
-        self.city_ids = self.global_features['To_City'].unique().astype('int16')
-        print(f"✓ 全局特征表已加载: {len(self.global_features):,} 行 (涵盖 {len(self.city_ids)} 个城市)")
-
-# ==============================================================================
-# 评估核心逻辑
-# ==============================================================================
-def evaluate_year(year, ctx, sample_size=None, cache_dir='output/cache'):
+# ------------------------------------------------------------------------------
+# 1. 核心辅助函数：读取宽表并转为长表 GT
+# ------------------------------------------------------------------------------
+def load_ground_truth(db_path, year):
     """
-    对指定年份进行全量召回评估
+    从 DuckDB 读取宽表数据，并展开为长表格式 (Year, Type, From, To, Rank)
     """
-    print(f"\n{'='*40}")
-    print(f"开始评估年份: {year}")
-    print(f"{'='*40}")
+    print(f"📥 Querying DuckDB for year {year} (Wide Table)...")
     
-    # 1. 获取 Ground Truth (真实流向)
-    # 使用 load_raw_data_fast 获取原始正样本
-    # 【优化】neg_sample_rate=0 表示不生成任何额外的负样本，只返回原始的正样本 (Rank 1-20)
-    print("Step 1: 加载测试集 Ground Truth...")
-    df_raw = load_raw_data_fast(Config.DB_PATH, year, hard_candidates=[], neg_sample_rate=0)
+    con = duckdb.connect(str(db_path), read_only=True)
     
-    if df_raw.empty:
-        print("❌ 该年份无数据")
-        return None
+    # 1. 构造 SQL 查询 Top 20 的列
+    # 我们需要 Year, Type_ID, From_City 以及所有的 To_TopX 和 To_TopX_Count
+    top_cols = []
+    for i in range(1, 21):
+        top_cols.append(f"To_Top{i}")
+        # top_cols.append(f"To_Top{i}_Count") # 其实评估只需要知道去哪了，Count 可选
+    
+    cols_str = ", ".join(top_cols)
+    
+    query = f"""
+    SELECT 
+        Year, 
+        Type_ID, 
+        From_City, 
+        {cols_str}
+    FROM migration_data
+    WHERE Year = {year}
+    """
+    
+    try:
+        df_wide = con.execute(query).df()
+        if df_wide.empty:
+            return pd.DataFrame()
+            
+        print(f"   ✓ Loaded {len(df_wide):,} wide rows. Unpivoting to long format...")
+        
+        # 2. 清洗 From_City (去除中文，只留 ID)
+        # 假设 From_City 可能是 "深圳(4403)" 这种格式
+        if df_wide['From_City'].dtype == 'object':
+             df_wide['From_City'] = df_wide['From_City'].astype(str).str.extract(r'(\d+)', expand=False)
+        df_wide['From_City'] = pd.to_numeric(df_wide['From_City'], errors='coerce').fillna(0).astype('int16')
 
-    # 再次过滤，确保只要 Rank <= 20 的作为 GT
-    # 我们这里只要 Rank <= 20 的作为 GT
-    df_pos = df_raw[df_raw['Rank'] <= 20].copy()
+        # 3. 宽表转长表 (Melt)
+        # id_vars = [Year, Type_ID, From_City]
+        # value_vars = [To_Top1, ..., To_Top20]
+        df_long = pd.melt(
+            df_wide, 
+            id_vars=['Year', 'Type_ID', 'From_City'], 
+            value_vars=[f"To_Top{i}" for i in range(1, 21)],
+            var_name='Rank_Str', 
+            value_name='To_City_Raw'
+        )
+        
+        # 4. 解析 Rank 和 To_City
+        # Rank_Str 是 "To_Top1", "To_Top2"... -> 提取数字作为 Rank
+        df_long['Rank'] = df_long['Rank_Str'].str.extract(r'(\d+)').astype(int).astype('int16')
+        
+        # To_City_Raw 可能是 "上海(3100)" 或 "0" 或 None
+        # 我们需要提取其中的数字 ID
+        df_long = df_long.dropna(subset=['To_City_Raw'])
+        # 转换为字符串处理
+        df_long['To_City_Raw'] = df_long['To_City_Raw'].astype(str)
+        # 提取数字 (如果本来就是数字字符串也能提取)
+        df_long['To_City'] = df_long['To_City_Raw'].str.extract(r'(\d+)', expand=False)
+        # 转为数字，非数字变为 NaN
+        df_long['To_City'] = pd.to_numeric(df_long['To_City'], errors='coerce')
+        
+        # 5. 过滤有效数据
+        # 去除 To_City 为 0 或 NaN 的行 (表示没有 TopX 数据)
+        # 也要去除 To_City == From_City 的行 (虽然理论上 Top 不应该包含自己)
+        df_valid = df_long[
+            (df_long['To_City'].notna()) & 
+            (df_long['To_City'] > 0)
+        ].copy()
+        
+        df_valid['To_City'] = df_valid['To_City'].astype('int16')
+        
+        # 只保留需要的列
+        final_df = df_valid[['Year', 'Type_ID', 'From_City', 'To_City', 'Rank']].reset_index(drop=True)
+        
+        return final_df
+
+    except Exception as e:
+        print(f"❌ DB Error: {e}")
+        return pd.DataFrame()
+    finally:
+        con.close()
+
+# ------------------------------------------------------------------------------
+# 2. 核心评估逻辑
+# ------------------------------------------------------------------------------
+def run_main(year, model_path, sample_size):
+    # 1. 加载资源
+    loader = CityDataLoader(Config.DATA_DIR).load_all()
+    pipeline = FeaturePipeline(loader, data_dir=Config.PROCESSED_DIR)
     
-    # 提取唯一的 Queries (Year, Type, From)
-    queries = df_pos[['Year', 'Type_ID', 'From_City']].drop_duplicates().reset_index(drop=True)
+    if not Path(model_path).exists():
+        print(f"❌ Model not found: {model_path}")
+        return
+    model = lgb.Booster(model_file=model_path)
+    model_feats = model.feature_name()
+    print(f"✅ Model loaded: {model_path} ({len(model_feats)} feats)")
+
+    # 2. 获取 GT (使用新函数)
+    df_true = load_ground_truth(Config.DB_PATH, year)
     
-    # 采样 (如果配置了)
+    if df_true.empty:
+        print("❌ No ground truth data found.")
+        return
+        
+    print(f"   ✓ Extracted {len(df_true):,} valid ground truth pairs (Rank <= 20)")
+
+    # 提取 Queries (Year, Type_ID, From_City)
+    queries = df_true[['Year', 'Type_ID', 'From_City']].drop_duplicates()
+    
     if sample_size and len(queries) > sample_size:
-        print(f"⚠️ 进行采样评估: {sample_size}/{len(queries)}")
-        queries = queries.sample(n=sample_size, random_state=42).reset_index(drop=True)
+        print(f"⚡ Sampling {sample_size} queries from {len(queries)}...")
+        queries = queries.sample(n=sample_size, random_state=42)
     else:
-        print(f"评估全量查询: {len(queries)} 个")
-
-    # 2. 构造全量候选集 (Query x 337 Cities)
-    # 这是 Recall 评估的关键：对每个出发的人群，我们要对全国所有城市打分
-    print(f"Step 2: 生成候选集 ({len(queries)} Queries x {len(ctx.city_ids)} Cities)...")
+        print(f"📊 Evaluating {len(queries)} queries...")
     
-    # 使用 Cross Join 构造
-    # 技巧：给两边都加一个常数 key 进行 merge
+    # 3. 构造候选集 (Query * All_Cities)
+    print("🔨 Generating Candidates...")
+    all_cities = loader.get_city_ids()
+    
+    # 笛卡尔积
+    queries = queries.copy()
     queries['key'] = 1
-    targets = pd.DataFrame({'To_City': ctx.city_ids, 'key': 1})
-    
-    # 笛卡尔积 (可能很大，注意内存)
+    targets = pd.DataFrame({'To_City': all_cities, 'key': 1})
     candidates = pd.merge(queries, targets, on='key').drop('key', axis=1)
     
-    # 排除 From == To 的情况 (自己不能流向自己)
+    # 排除 From == To
     candidates = candidates[candidates['From_City'] != candidates['To_City']].copy()
     
-    print(f"候选集大小: {len(candidates):,} 行")
+    # 4. 特征工程
+    print("✨ Feature Engineering...")
+    # 为了复用 pipeline，需要 Flow_Count 占位
+    candidates['Flow_Count'] = 0 
     
-    # 3. 特征工程 (复用训练时的逻辑)
-    print("Step 3: 特征工程...")
+    # Pipeline 变换 (生成特征)
+    df_feats = pipeline.transform(candidates.copy(), year, mode='eval', verbose=False)
     
-    # A. 合并静态特征 (Year, From, To)
-    # 注意：global_features 包含 Year 列，会自动对齐
-    candidates = candidates.merge(
-        ctx.global_features, 
-        on=['Year', 'From_City', 'To_City'], 
-        how='left'
-    )
+    # 类型处理 (与训练一致)
+    if 'Type_ID' in df_feats.columns and df_feats['Type_ID'].dtype == 'object':
+        df_feats['Type_Hash'] = pd.util.hash_pandas_object(df_feats['Type_ID'], index=False).astype('int64')
+        df_feats.drop(columns=['Type_ID'], inplace=True)
     
-    # B. 解析 Type_ID (Gender, Age, etc.)
-    # 对 unique Type_ID 解析一次，然后 merge 回去 (比直接 apply 快 100倍)
-    unique_types = candidates[['Type_ID']].drop_duplicates()
-    unique_types_parsed, _ = parse_type_id(unique_types, verbose=False)
-    
-    # 如果 parse_type_id 删除了 Type_ID 列，需要恢复以便 merge
-    if 'Type_ID' not in unique_types_parsed.columns and 'Type_ID_orig' in unique_types_parsed.columns:
-         unique_types_parsed['Type_ID'] = unique_types_parsed['Type_ID_orig'] # 恢复用于Merge
-    elif 'Type_ID' not in unique_types_parsed.columns:
-         # 兜底：如果 parse_type_id 实现改变
-         unique_types_parsed['Type_ID'] = unique_types['Type_ID'].values
-         
-    # 移除 Type_ID_orig 避免重复
-    if 'Type_ID_orig' in unique_types_parsed.columns:
-        unique_types_parsed = unique_types_parsed.drop(columns=['Type_ID_orig'])
-        
-    candidates = candidates.merge(unique_types_parsed, on='Type_ID', how='left')
-
-    # C. 添加历史特征
-    # 关键：指向 output/cache，因为 fast_train 把处理好的历史数据存在那里
-    # training_mode=False (不进行 Dropout，使用全部历史信息)
-    candidates = add_historical_features(
-        candidates, 
-        year, 
-        data_dir=Path(cache_dir), 
-        verbose=False, 
-        training_mode=False
-    )
-    
-    # D. 准备特征矩阵 X
-    # 确保列顺序与模型一致，缺失列填 0
-    for col in ctx.feature_cols:
-        if col not in candidates.columns:
-            candidates[col] = 0
+    # 准备 X (特征矩阵)
+    X = pd.DataFrame(index=df_feats.index)
+    for f in model_feats:
+        if f in df_feats.columns:
+            X[f] = df_feats[f]
+        else:
+            X[f] = 0
             
-    X = candidates[ctx.feature_cols]
-    
-    # 4. 预测
-    print("Step 4: 模型打分...")
-    candidates['pred_score'] = ctx.model.predict(X)
-    
-    # 5. 计算指标
-    print("Step 5: 计算评估指标...")
-    metrics = calculate_metrics(candidates, df_pos)
-    
-    # 清理内存
-    del candidates, X, df_raw, df_pos
-    gc.collect()
-    
-    return metrics
+    # 转 float32
+    for c in X.columns:
+        if X[c].dtype == 'float64': X[c] = X[c].astype('float32')
 
-def calculate_metrics(candidates, ground_truth):
-    """
-    向量化计算 Recall@K
-    """
-    # 1. 准备 Ground Truth 集合 (Year, Type, From, To)
-    gt_set = ground_truth[['Year', 'Type_ID', 'From_City', 'To_City']].copy()
-    gt_set['is_true'] = 1
+    # 5. 预测
+    print("🔮 Predicting...")
+    # 将预测分数赋值回 candidates (用于后续排序)
+    candidates['score'] = model.predict(X)
     
-    # 2. 对每个 Query 内部按分数排序
-    # 使用 groupby + rank (method='first' 保证排名连续)
-    # ascending=False 表示分数越高排名越前 (1 是第一名)
-    candidates['rank'] = candidates.groupby(['Year', 'Type_ID', 'From_City'])['pred_score'] \
-                                   .rank(method='first', ascending=False)
+    # 6. 计算指标 (Recall@K)
+    print("📉 Calculating Metrics...")
     
-    # 3. 只保留 Top 20 的预测结果用于评估 (节省 Join 资源)
+    # 6.1 构造快速查找的 GT 集合
+    # 格式: (Type_ID, From_City, To_City) -> True
+    gt_set = set(zip(df_true['Type_ID'], df_true['From_City'], df_true['To_City']))
+    
+    # 6.2 排序: 对每个 (Type_ID, From_City) 分组，按分数降序排列
+    candidates['rank'] = candidates.groupby(['Type_ID', 'From_City'])['score'].rank(method='first', ascending=False)
+    
+    # 6.3 只保留 Top 20 预测结果进行统计
     top_preds = candidates[candidates['rank'] <= 20].copy()
     
-    # 4. 标记命中情况
-    # Left Join Truth: 如果预测的 (Query, To) 在 Truth 里，is_true 就是 1
-    merged = pd.merge(
-        top_preds, 
-        gt_set, 
-        on=['Year', 'Type_ID', 'From_City', 'To_City'], 
-        how='left'
-    )
-    merged['is_hit'] = merged['is_true'].fillna(0)
+    # 6.4 判断是否命中 GT
+    top_preds['is_hit'] = top_preds.apply(lambda x: (x['Type_ID'], x['From_City'], x['To_City']) in gt_set, axis=1)
     
-    # 5. 聚合计算每个 Query 的命中数
-    # 技巧：直接判断 rank <= K 且 is_hit == 1
-    hits = merged.groupby(['Year', 'Type_ID', 'From_City']).apply(
+    # 6.5 聚合统计
+    hits = top_preds.groupby(['Type_ID', 'From_City']).apply(
         lambda x: pd.Series({
-            'hit_1': ((x['rank'] <= 1) & (x['is_hit'] == 1)).sum(),
-            'hit_5': ((x['rank'] <= 5) & (x['is_hit'] == 1)).sum(),
-            'hit_10': ((x['rank'] <= 10) & (x['is_hit'] == 1)).sum(),
-            'hit_20': ((x['rank'] <= 20) & (x['is_hit'] == 1)).sum()
+            'hit_1': x[x['rank'] <= 1]['is_hit'].sum(),
+            'hit_5': x[x['rank'] <= 5]['is_hit'].sum(),
+            'hit_10': x[x['rank'] <= 10]['is_hit'].sum(),
+            'hit_20': x[x['rank'] <= 20]['is_hit'].sum()
         })
     ).reset_index()
     
-    # 6. 计算每个 Query 的真实正样本总数 (分母)
-    gt_counts = gt_set.groupby(['Year', 'Type_ID', 'From_City']).size().reset_index(name='total_true')
+    # 获取每个 Query 对应的真实流向总数 (分母)
+    gt_counts = df_true.groupby(['Type_ID', 'From_City']).size().reset_index(name='total_true')
     
-    # 7. 合并分子分母
-    eval_df = pd.merge(gt_counts, hits, on=['Year', 'Type_ID', 'From_City'], how='left').fillna(0)
+    # 合并
+    res = pd.merge(hits, gt_counts, on=['Type_ID', 'From_City'], how='left').fillna(0)
     
-    # 8. 计算 Recall (平均值)
-    # 防止除以 0 (虽然理论上 total_true >= 1)
-    eval_df['total_true'] = eval_df['total_true'].replace(0, 1)
+    # 计算平均 Recall
+    res['total_true'] = res['total_true'].replace(0, 1)
     
-    recall_1 = (eval_df['hit_1'] / eval_df['total_true']).mean()
-    recall_5 = (eval_df['hit_5'] / eval_df['total_true']).mean()
-    recall_10 = (eval_df['hit_10'] / eval_df['total_true']).mean()
-    recall_20 = (eval_df['hit_20'] / eval_df['total_true']).mean()
+    r1 = (res['hit_1'] / res['total_true']).mean()
+    r5 = (res['hit_5'] / res['total_true']).mean()
+    r10 = (res['hit_10'] / res['total_true']).mean()
+    r20 = (res['hit_20'] / res['total_true']).mean()
     
-    return {
-        'recall_1': recall_1,
-        'recall_5': recall_5,
-        'recall_10': recall_10,
-        'recall_20': recall_20,
-        'avg_gt_size': eval_df['total_true'].mean(),
-        'num_queries': len(eval_df)
-    }
-
-# ==============================================================================
-# 单次推理接口 (用于演示)
-# ==============================================================================
-def predict_one(year, type_id, from_city, ctx):
-    """
-    单次推理：预测某个人群从某城市出发，最可能去的 Top 10 城市
-    """
-    print(f"\n🔮 单次推理: {year} | {type_id} | From: {from_city}")
-    
-    # 1. 构造 Query DataFrame
-    query = pd.DataFrame([{
-        'Year': year,
-        'Type_ID': type_id,
-        'From_City': int(from_city)
-    }])
-    
-    # 2. 构造 Candidates (1 Query x 337 Cities)
-    targets = pd.DataFrame({'To_City': ctx.city_ids})
-    targets['key'] = 1
-    query['key'] = 1
-    candidates = pd.merge(query, targets, on='key').drop('key', axis=1)
-    candidates = candidates[candidates['From_City'] != candidates['To_City']].copy()
-    
-    # 3. 特征工程 (简化版)
-    candidates = candidates.merge(ctx.global_features, on=['Year', 'From_City', 'To_City'], how='left')
-    
-    types, _ = parse_type_id(candidates[['Type_ID']].drop_duplicates(), verbose=False)
-    # 兼容列名
-    if 'Type_ID' not in types.columns and 'Type_ID_orig' in types.columns:
-        types['Type_ID'] = types['Type_ID_orig']
-        
-    candidates = candidates.merge(types, on='Type_ID', how='left')
-    
-    candidates = add_historical_features(candidates, year, data_dir=Path(Config.OUTPUT_DIR)/'cache', verbose=False)
-    
-    for col in ctx.feature_cols:
-        if col not in candidates.columns:
-            candidates[col] = 0
-            
-    # 4. 预测
-    scores = ctx.model.predict(candidates[ctx.feature_cols])
-    candidates['score'] = scores
-    
-    # 5. 排序输出
-    top10 = candidates.nlargest(10, 'score')[['To_City', 'score']]
-    
-    # 尝试加载城市名
-    city_map = {}
-    try:
-        loader = CityDataLoader(Config.DATA_DIR)
-        loader.load_city_nodes()
-        city_map = loader.get_city_id_to_name()
-    except:
-        pass
-        
-    print(f"{'Rank':<5} {'City ID':<10} {'Name':<15} {'Score':<10}")
-    print("-" * 45)
-    for i, (idx, row) in enumerate(top10.iterrows(), 1):
-        # 【修正】强制转为 int 再查表
-        city_id_val = int(row['To_City'])
-
-        # 安全查表逻辑
-        # 确保 city_map 的 key 也是 int
-        # 假设 loader.get_city_id_to_name() 返回的是 {1301: '石家庄'}
-        # 如果 key 是 string，则用 str(city_id_val)
-        name = city_map.get(city_id_val, city_map.get(str(city_id_val), "Unknown"))
-
-        print(f"{i:<5} {city_id_val:<10} {name:<15} {row['score']:.4f}")
+    print("\n" + "="*40)
+    print(f"📊 Evaluation Results for Year {year}")
+    print("="*40)
+    print(f"Queries Evaluated : {len(res)}")
+    print(f"Avg GT per Query: {res['total_true'].mean():.2f}")
+    print("-" * 30)
+    print(f"Recall@1  : {r1:.2%}")
+    print(f"Recall@5  : {r5:.2%}")
+    print(f"Recall@10 : {r10:.2%}")
+    print(f"Recall@20 : {r20:.2%}")
+    print("="*40)
 
 if __name__ == "__main__":
-    import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--year', type=int, default=2010, help="评估年份")
-    parser.add_argument('--sample', type=int, default=50000, help="采样Query数，0为全量")
-    parser.add_argument('--model', type=str, default=None, help="模型文件路径 (默认自动查找最新)")
-    parser.add_argument('--predict', action='store_true', help="运行单次推理演示")
+    parser.add_argument('--year', type=int, default=2018, help="Year to evaluate")
+    parser.add_argument('--model', type=str, default=None, help="Path to model file")
+    parser.add_argument('--sample', type=int, default=1000, help="Number of queries to sample (speed up)")
     args = parser.parse_args()
     
-    # 初始化上下文
-    ctx = EvalContext()
+    # 自动查找模型
+    if args.model is None:
+        p = Path(Config.OUTPUT_DIR) / f"lgb_batch_end_{args.year}.txt"
+        if not p.exists():
+             models = list(Path(Config.OUTPUT_DIR).glob("lgb_batch_end_*.txt"))
+             if models:
+                 p = max(models, key=lambda f: f.stat().st_mtime)
+        args.model = str(p)
 
-    # 【快速评估】使用刚训练好的模型
-    # 如果未指定 --model 参数，默认使用最新的 lgb_end_2012.txt
-    if args.model:
-        model_path = Path(args.model)
-    else:
-        # 自动查找最新的 end_year 模型
-        model_dir = Path(Config.OUTPUT_DIR) / 'models'
-        if model_dir.exists():
-            # 查找所有 lgb_end_*.txt 文件
-            models = list(model_dir.glob('lgb_end_*.txt'))
-            if models:
-                # 按修改时间排序，取最新的
-                model_path = max(models, key=lambda p: p.stat().st_mtime)
-                print(f"✓ 自动检测到最新模型: {model_path}")
-            else:
-                model_path = Path(Config.OUTPUT_DIR) / 'fast_model.txt'
-        else:
-            model_path = Path(Config.OUTPUT_DIR) / 'fast_model.txt'
-    
-    if not model_path.exists():
-        print(f"❌ 未找到模型文件: {model_path}")
-    else:
-        ctx.load_resources(model_path)
-        
-        # 缓存目录 (fast_train.py 的输出目录)
-        CACHE_DIR = Path(Config.OUTPUT_DIR) / 'cache'
-        
-        # 运行评估
-        metrics = evaluate_year(args.year, ctx, sample_size=args.sample if args.sample > 0 else None, cache_dir=CACHE_DIR)
-        
-        if metrics:
-            print("\n" + "="*40)
-            print(f"📊 评估结果报告 ({args.year})")
-            print("="*40)
-            print(f"Query样本数 : {metrics['num_queries']}")
-            print(f"平均正样本数 : {metrics['avg_gt_size']:.2f}")
-            print("-" * 30)
-            print(f"Recall@1   : {metrics['recall_1']:.2%}")
-            print(f"Recall@5   : {metrics['recall_5']:.2%}")
-            print(f"Recall@10  : {metrics['recall_10']:.2%}")
-            print(f"Recall@20  : {metrics['recall_20']:.2%}")
-            print("="*40)
-            
-        # 运行演示
-        if args.predict:
-            # 找一个存在的 Type_ID 和 City 演示
-            predict_one(args.year, 'F_30_EduHi_Service_IncML_Unit_5119', 5119, ctx)
+    run_main(args.year, args.model, args.sample)
