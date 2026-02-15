@@ -8,6 +8,7 @@
 """
 import lightgbm as lgb
 import pandas as pd
+import numpy as np
 import gc
 import time
 import argparse
@@ -17,28 +18,49 @@ from src.config import Config
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-# 极速配置
-FAST_PARAMS = {
-    'objective': 'binary',
-    'metric': ['binary_logloss', 'auc'],
-    'boosting_type': 'goss',
-    'top_rate': 0.2,
-    'other_rate': 0.1,
-    'num_leaves': 31,
-    'max_depth': 8,
-    'max_bin': 63,
-    'learning_rate': 0.15,
-    'n_estimators': 1000,
-    'colsample_bytree': 0.8,
-    'min_child_samples': 100,
-    'lambda_l1': 0.1,
-    'lambda_l2': 0.1,
-    'n_jobs': 24,
-    'verbosity': -1
-}
-
 def print_log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}")
+
+def calculate_sample_weights(df, end_year, decay_rate=0.9):
+    """
+    计算样本权重：时间衰减 + 差异化样本权重
+
+    参数:
+    - df: 训练数据 DataFrame (必须包含 Rank, Label, Year 列)
+    - end_year: 目标预测年份
+    - decay_rate: 时间衰减率 (默认 0.9，即每年衰减 10%)
+
+    返回:
+    - weights: 样本权重数组
+    """
+    # 1. 时间衰减权重
+    year_diff = end_year - df['Year']
+    time_weights = decay_rate ** year_diff
+
+    # 2. 样本类型权重
+    base_weights = np.ones(len(df), dtype=np.float32)
+
+    # 正样本 (Rank 1-10, Label=1)
+    pos_mask = (df['Label'] == 1.0)
+    if pos_mask.any():
+        rank = df['Rank'].copy()
+        # 头部保护 (Rank 1-3)
+        top3_mask = pos_mask & (rank <= 3)
+        base_weights[top3_mask] = 20.0
+        # 其他正样本 (Rank 4-10)
+        other_pos_mask = pos_mask & (rank > 3) & (rank <= 10)
+        base_weights[other_pos_mask] = 10.0
+
+    # 困难负样本 (Rank 11-20, Label=0) - Hard Negative Mining
+    hard_neg_mask = (df['Label'] == 0.0) & (df['Rank'] > 10) & (df['Rank'] <= 20)
+    base_weights[hard_neg_mask] = 5.0
+
+    # 普通负样本 (Rank > 20 或 Rank 为 97/98/99) 权重保持为 1.0
+
+    # 3. 组合权重
+    final_weights = base_weights * time_weights
+
+    return final_weights
 
 def load_data_batch(years, shuffle=True):
     """
@@ -60,12 +82,34 @@ def load_data_batch(years, shuffle=True):
     
     # 合并
     df_batch = pd.concat(dfs, axis=0, ignore_index=True)
-    
+
+    # 生成 qid (Query ID) 如果不存在
+    # qid 用于按 Query 完整采样,确保验证集的 Recall 指标准确
+    if 'qid' not in df_batch.columns:
+        print_log("   🆔 Generating qid (Query ID) for batch...")
+        # parquet 文件中 Type_ID 被转为 Type_Hash，使用它来区分不同类型
+        if 'Type_Hash' in df_batch.columns:
+            df_batch['qid'] = (
+                df_batch['Year'].astype('int64') * 100000 +
+                df_batch['Type_Hash'].astype('int64') % 1000 +  # 取模避免数值过大
+                df_batch['From_City'].astype('int64')
+            ).astype('int64')
+        else:
+            # 降级方案：只用 Year + From_City
+            df_batch['qid'] = (
+                df_batch['Year'].astype('int64') * 100000 +
+                df_batch['From_City'].astype('int64')
+            ).astype('int64')
+
+    # 确保 Rank 列存在 (用于计算权重)
+    if 'Rank' not in df_batch.columns:
+        print_log("   ⚠️ Warning: Rank column not found, weights will be uniform")
+
     # Batch内部打乱
     if shuffle:
         print_log(f"   🔀 Shuffling {len(df_batch):,} rows...")
         df_batch = df_batch.sample(frac=1, random_state=42).reset_index(drop=True)
-        
+
     return df_batch
 
 # === 新增：Checkpoint 回调函数 ===
@@ -105,17 +149,29 @@ def train_batch_mode(target_end_year, batch_size_years=5, checkpoint_freq=50):
     # 2. 准备验证集
     print_log("\n📦 Loading Validation Data (Global)...")
     df_val = load_data_batch(val_years, shuffle=False)
-    
-    # 【提速优化核心】
-    # 构造一个极小的验证集 (20万) 专门用于 Early Stopping 和 实时打印
-    # 原始 200万 太大了，每轮评估太慢
-    WATCH_SIZE = 200000 
-    
+
+    # 【精度优化】按 Query 完整采样,不随机拆分行
+    # 构造一个极小的验证集 (20万行) 专门用于 Early Stopping 和 实时打印
+    # 关键: 按 qid 分组,确保一个 Query 的所有样本都在验证集中
+    WATCH_SIZE = 200000
+
     if len(df_val) > WATCH_SIZE:
-        print_log(f"⚡ Creating Mini-Validation Set for Speed: {WATCH_SIZE:,} rows")
-        # 分离出 mini set
-        df_val_watch = df_val.sample(n=WATCH_SIZE, random_state=42).reset_index(drop=True)
-        # 释放原始大表 (如果内存紧张) - 或者保留用于最后 Full Evaluate (这里为了省内存先释放)
+        print_log(f"⚡ Creating Mini-Validation Set for Speed: ~{WATCH_SIZE:,} rows")
+        print_log(f"   📊 Sampling by complete queries (qid) to preserve Recall metric...")
+
+        # 计算需要的 query 数量
+        avg_samples_per_query = len(df_val) / df_val['qid'].nunique()
+        n_queries_needed = int(WATCH_SIZE / avg_samples_per_query)
+
+        # 随机采样完整的 query
+        unique_qids = df_val['qid'].unique()
+        sampled_qids = pd.Series(unique_qids).sample(n=n_queries_needed, random_state=42).values
+
+        # 保留这些 query 的所有样本
+        df_val_watch = df_val[df_val['qid'].isin(sampled_qids)].reset_index(drop=True)
+        print_log(f"   ✅ Sampled {len(sampled_qids):,} queries -> {len(df_val_watch):,} rows")
+
+        # 释放原始大表
         del df_val
         gc.collect()
     else:
@@ -136,7 +192,7 @@ def train_batch_mode(target_end_year, batch_size_years=5, checkpoint_freq=50):
         df_val_watch[feats], 
         label=df_val_watch['Label'], 
         categorical_feature=cats, 
-        params=FAST_PARAMS, 
+        params=Config.LGBM_PARAMS, 
         free_raw_data=False 
     )
     val_ds_watch.construct()
@@ -169,15 +225,25 @@ def train_batch_mode(target_end_year, batch_size_years=5, checkpoint_freq=50):
         # ======================= 【特征对齐结束】 =======================
 
         print_log(f"   Rows: {len(df_train):,} | Memory: {df_train.memory_usage(deep=True).sum()/1024**3:.2f} GB")
-        
+
+        # ======================= 【样本权重计算】 =======================
+        # 计算样本权重：时间衰减 + 差异化权重
+        print_log("   🎯 Calculating sample weights (Time Decay + Reweighting)...")
+        weights = calculate_sample_weights(df_train, target_end_year, decay_rate=0.9)
+
+        # 打印权重统计
+        print_log(f"   📊 Weight stats: min={weights.min():.4f}, max={weights.max():.4f}, mean={weights.mean():.4f}")
+        # ======================= 【权重计算结束】 =======================
+
         # 构建 Dataset
         t_build = time.time()
         train_ds = lgb.Dataset(
-            df_train[feats], 
-            label=df_train['Label'], 
-            categorical_feature=cats, 
-            params=FAST_PARAMS,
-            free_raw_data=False 
+            df_train[feats],
+            label=df_train['Label'],
+            weight=weights,  # 应用样本权重
+            categorical_feature=cats,
+            params=Config.LGBM_PARAMS,
+            free_raw_data=False
         )
         train_ds.construct()
         print_log(f"   Dataset Built: {time.time()-t_build:.1f}s")
@@ -198,7 +264,7 @@ def train_batch_mode(target_end_year, batch_size_years=5, checkpoint_freq=50):
             ]
 
             model = lgb.train(
-                FAST_PARAMS,
+                Config.LGBM_PARAMS,
                 train_ds,
                 num_boost_round=1000, 
                 # 【提速关键】valid_sets 只放 mini 验证集，且不放训练集

@@ -97,13 +97,14 @@ def run_main(year, model_path, sample_size):
 
     print(f"   ✓ Extracted {len(df_true):,} valid ground truth pairs")
 
-    # 采样
+    # 采样 (可选)
     queries = df_true[['Year', 'Type_ID', 'From_City']].drop_duplicates()
-    if sample_size and len(queries) > sample_size:
+    if sample_size is not None and len(queries) > sample_size:
         print(f"⚡ Sampling {sample_size} queries from {len(queries)}...")
         queries = queries.sample(n=sample_size, random_state=42)
+        print(f"   ✅ Using {sample_size} sampled queries for evaluation")
     else:
-        print(f"📊 Evaluating {len(queries)} queries...")
+        print(f"📊 Full evaluation: {len(queries)} queries (no sampling)")
 
     # 3. 构造候选集 (候选 ID 必须是 Int)
     print("🔨 Generating Candidates...")
@@ -179,11 +180,11 @@ def run_main(year, model_path, sample_size):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--year', type=int, default=2018, help="Year to evaluate")
+    parser.add_argument('--year', type=int, required=True, help="Year to evaluate (required)")
     parser.add_argument('--model', type=str, default=None, help="Specific path to model checkpoint")
-    parser.add_argument('--sample', type=int, default=1000, help="Number of queries to sample")
+    parser.add_argument('--sample', type=int, default=None, help="Number of queries to sample (default: full evaluation)")
     args = parser.parse_args()
-    
+
     # 自动查找模型 (仅当未指定时)
     if args.model is None:
         print("⚠️ No model path provided, trying to auto-find latest model...")
@@ -193,5 +194,11 @@ if __name__ == "__main__":
              if models:
                  p = max(models, key=lambda f: f.stat().st_mtime)
         args.model = str(p)
+
+    print(f"\n🎯 Evaluation Configuration:")
+    print(f"   Year: {args.year}")
+    print(f"   Model: {args.model}")
+    print(f"   Sample: {args.sample if args.sample else 'Full (all queries)'}")
+    print()
 
     run_main(args.year, args.model, args.sample)

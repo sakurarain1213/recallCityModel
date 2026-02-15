@@ -180,4 +180,13 @@ def load_raw_data_fast(db_path, year, hard_candidates, total_samples=50):
     if 'Flow_Count' not in df_final.columns:
         df_final['Flow_Count'] = 0
 
+    # 生成 qid (Query ID): 用于按 Query 完整采样
+    # qid = Year * 100000 + Type_ID * 1000 + From_City
+    # 确保每个 Query 有唯一 ID
+    df_final['qid'] = (
+        df_final['Year'].astype('int64') * 100000 +
+        df_final['Type_ID'].astype('int64') * 1000 +
+        df_final['From_City'].astype('int64')
+    ).astype('int64')
+
     return df_final

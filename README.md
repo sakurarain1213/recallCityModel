@@ -1,24 +1,40 @@
 # 基于 LightGBM 的人口流动预测模型，用于预测不同人群类型在城市间的流动方向和规模。采用召回模式(Recall Mode)，结合动态城市特征和历史流动数据训练模型。
+
+## 此版本效果
+```
+Queries Evaluated : 5000
+Avg GT per Query: 8.64
+------------------------------
+Recall@1  : 15.21%
+Recall@5  : 55.68%
+Recall@10 : 90.60% ⭐
+Recall@20 : 95.74% ⭐
+```
+
 ```
 常用命令与流程
 uv run generate_data.py
 uv run fast_train.py --end_year 2020
+
+验证方面：
+# 全量验证 (默认)
+python evaluate.py --year 2020
+或者指定模型参数 或者采样验证 (可选)
 uv run evaluate.py --year 2020 --sample 10000
-或者指定模型参数
 uv run evaluate.py --year 2020 --model output/checkpoints/model_2020_round_50.txt --sample 5000
 ```
 
 
 ```
 服务器版本
-本地： ssh -p 2023 -R 10080:127.0.0.1:7890 -N wxj@10.82.1.210
+本地： ssh -p 2023 -R 8082:127.0.0.1:7890 -N wxj@10.82.1.210
 服务器：
 cd /data1/wxj/Recall_city_project
 unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
-export http_proxy="http://127.0.0.1:10080"
-export https_proxy="http://127.0.0.1:10080"
-export HTTP_PROXY="http://127.0.0.1:10080"
-export HTTPS_PROXY="http://127.0.0.1:10080"
+export http_proxy="http://127.0.0.1:8082"
+export https_proxy="http://127.0.0.1:8082"
+export HTTP_PROXY="http://127.0.0.1:8082"
+export HTTPS_PROXY="http://127.0.0.1:8082"
 curl -v https://api.github.com  
 ```
 
@@ -59,11 +75,11 @@ Batch Size只要内存支持 每次可以训练更久的年份 如5年一批甚�
 【okk】可视化增强 (User Req 1): 在训练结束时输出 Feature Importance 图片。
 
 【okk】训练策略重构 (User Req 2): 放弃逐年增量训练，改为 Batch 训练。
-原因: 逐年训练 (init_model) 在 LightGBM 中会导致"遗忘灾难"。2001年的规律到2010年虽然有漂移，但基础规律（如距离衰减、省内流动）是不变的。我的需求是只指定结束年份 比如--2012  那么2001-2003 每三年一个batch进行训练  验证集永远是结束年份的前2年即2010全量和2011全量  然后2012这一年全量作为evaluate的测试集。
+原因: 逐年训练 (init_model) 在 LightGBM 中会导致"遗忘灾难"。2001年的规律到2010年虽然有漂移，但基础规律（如距离衰减、省内流动）是不变的。需求是只指定结束年份 比如--2012  那么2001-2003 每三年一个batch进行训练  验证集永远是结束年份的前2年即2010全量和2011全量  然后2012这一年全量作为evaluate的测试集。
 
 【okk】负样本策略革命 (User Req 5 - 最关键):
 引入"省内干扰": 绝大多数流动发生在省内。模型必须学会区分"省会城市"和"省内其他城市"。
-引入"排名靠后干扰" (Rank 11-20): 你希望 Recall@10 高，那么 Rank 11-20 就是最强的干扰项（Hard Negative）。把它们标记为负样本（Label=0），强迫模型把它们排在 Top 10 之外。  然后也需要本省内非出发城市非热门城市的所有省内其它城市 作为负样本
+引入"排名靠后干扰" (Rank 11-20): 希望 Recall@10 高，那么 Rank 11-20 就是最强的干扰项（Hard Negative）。把它们标记为负样本（Label=0），强迫模型把它们排在 Top 10 之外。  然后也需要本省内非出发城市非热门城市的所有省内其它城市 作为负样本
 最后 保证随机从剩下的全国城市随机采样作为负样本
 最后保证训练的时候 一个query top10作为正样本  剩下大约40个城市作为负样本
 
@@ -103,8 +119,55 @@ Batch Size只要内存支持 每次可以训练更久的年份 如5年一批甚�
 
 ```
 
+目前的特征工程
+```
+被利用的特征
+1. 从 .db 读取并保留的基础字段
+Year - 年份
+From_City - 出发城市ID
+To_City - 目标城市ID
+Type_ID → 转换为 Type_Hash + 6个维度特征
+2. Type_ID 解析出的 6 个维度特征（src/feature_eng.py:44）
+gender - 性别
+age_group - 年龄段
+education - 学历
+industry - 行业
+income - 收入
+family - 家庭状态
+3. 交叉特征（src/feature_eng.py）
+age_edu - 年龄×学历交叉
+age_ind - 年龄×行业交叉
+age_inc - 年龄×收入交叉
+edu_inc - 学历×收入交叉
+4. 地理特征
+geo_distance - 地理距离
+is_same_province - 是否同省
+5. 历史特征（src/historical_features.py）
+hist_1y_count - 1年历史计数
+hist_3y_count - 3年历史计数
+hist_5y_count - 5年历史计数
+hist_1y_rank - 1年历史排名
+hist_3y_rank - 3年历史排名
+hist_5y_rank - 5年历史排名
+6. 训练专用字段（不做特征）
+Label - 标签
+Rank - 排名
+Flow_Count - 流量计数
+qid - Query ID（用于采样）
+❌ .db 中有但未被利用的字段
+1. .db 中的所有字段（根据 schema）
+Year, Month, Type_ID, Birth_Region, From_City, Total_Count, 
+Stay_Prob, Outflow_Count, 
+To_Top1, To_Top1_Count, To_Top2, To_Top2_Count, ... To_Top20, To_Top20_Count
+2. 未使用的字段：
+❌ Month - 月份（完全未使用）
+❌ Birth_Region - 出生地区（完全未使用）
+❌ Total_Count - 该类型总计数（未使用）
+❌ Stay_Prob - 停留概率（未使用，这是很重要的特征！）
+❌ Outflow_Count - 流出总数（未使用）
+❌ To_Top1_Count ~ To_Top20_Count - 各目标城市的流量计数（未使用）
 
-
+```
 
 
 
@@ -374,7 +437,7 @@ uv run evaluate_pre.py
 
 ### 评估指标说明
 
-运行 `uv run evaluate.py` 后，你会看到类似以下输出:
+运行 `uv run evaluate.py` 后，会看到类似以下输出:
 
 ```
 ========================================
