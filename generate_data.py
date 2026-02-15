@@ -104,7 +104,7 @@ def generate_all_data(start_year, end_year):
     hard_candidates = loader.get_city_ids()
 
     for year in range(start_year, end_year + 1):
-        out_file = Path(Config.PROCESSED_DIR) / f"train_{year}.parquet"
+        out_file = Path(Config.PROCESSED_DIR) / f"processed_{year}.parquet"
         if out_file.exists():
             print(f"✅ Year {year} 已存在，跳过。")
             continue

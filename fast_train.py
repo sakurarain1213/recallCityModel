@@ -47,7 +47,7 @@ def load_data_batch(years, shuffle=True):
     dfs = []
     print_log(f"   📥 Loading parquet for years: {years}")
     for year in years:
-        p = Path(Config.PROCESSED_DIR) / f"train_{year}.parquet"
+        p = Path(Config.PROCESSED_DIR) / f"processed_{year}.parquet"
         if p.exists():
             df = pd.read_parquet(p)
             # 简单的防御性类型转换
@@ -156,7 +156,18 @@ def train_batch_mode(target_end_year, batch_size_years=3, checkpoint_freq=50):
         # 加载 -> 打乱
         df_train = load_data_batch(batch_years, shuffle=True)
         if df_train is None: continue
-            
+
+        # ======================= 【特征对齐】 =======================
+        # 🛡️ 确保训练集包含所有验证集有的特征
+        # 如果早期年份缺少 5y_avg 等特征，手动补上并填 -1
+        missing_cols = [c for c in feats if c not in df_train.columns]
+        if missing_cols:
+            print_log(f"   ⚠️ Aligning features: Filling {len(missing_cols)} missing cols (e.g., {missing_cols[0]}) with -1")
+            for c in missing_cols:
+                df_train[c] = -1.0
+                df_train[c] = df_train[c].astype('float32')
+        # ======================= 【特征对齐结束】 =======================
+
         print_log(f"   Rows: {len(df_train):,} | Memory: {df_train.memory_usage(deep=True).sum()/1024**3:.2f} GB")
         
         # 构建 Dataset
