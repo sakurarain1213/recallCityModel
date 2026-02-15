@@ -85,7 +85,7 @@ def save_checkpoint_callback(save_freq, output_dir, year_prefix):
             print_log(f"   💾 Checkpoint saved: {path.name}")
     return callback
 
-def train_batch_mode(target_end_year, batch_size_years=3, checkpoint_freq=50):
+def train_batch_mode(target_end_year, batch_size_years=5, checkpoint_freq=50):
     total_start = time.time()
     print("="*60)
     print(f"🚀 Batch Training Task: End Year {target_end_year}")
@@ -251,7 +251,7 @@ def train_batch_mode(target_end_year, batch_size_years=3, checkpoint_freq=50):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--end_year', type=int, default=2020, help='Target End Year')
-    parser.add_argument('--batch_size', type=int, default=3, help='Years per batch')
+    parser.add_argument('--batch_size', type=int, default=5, help='Years per batch')
     parser.add_argument('--ckpt_freq', type=int, default=50, help='Checkpoint frequency')
     args = parser.parse_args()
     

@@ -27,6 +27,13 @@ curl -v https://api.github.com
 # TODO
 核心改进策略
 
+Batch Size只要内存支持 每次可以训练更久的年份 如5年一批甚至更久
+
+特征权重！
+核心：时间衰减加权 越近的数据越重要。在 fast_train.py 中给不同年份的数据赋予不同的权重。
+核心：#基础样本权重 (Top10 重要性最高  【是否要为前10按照rank也赋予不同的label 不是全部是1】)  11-337的label都是0。
+
+
 【okk】修改evaluate的ground truth 目前非空的事实选择城市平均query有14个  实际上只关心top10正确性
 
 【okk】设置早停更慢 验证更充分
