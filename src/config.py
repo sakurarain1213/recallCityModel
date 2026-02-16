@@ -28,50 +28,22 @@ class Config:
         5101, 3301, 5000, 4201, 6101, 3205, 3201, 1200, 4101, 4301, 4419, 4406 # 新一线
     ]
 
-    # 训练参数
-    SEED = 42
+    # --- 训练策略配置 ---
+    # 分批训练：每批使用几年数据
+    TRAIN_BATCH_SIZE_YEARS = 3
 
-    # 数据集划分
-    DATA_START_YEAR = 2000
+    # 早停轮数（Early Stopping）
+    EARLY_STOPPING_ROUNDS = 100
 
-    # 【分批训练策略】三年一个 Batch，适应 14GB 内存限制
-    # 每批使用 3 年训练数据，内存需求约 8-10GB ✅
-    #
-    # Batch 划分:
-    #   Batch 1: 训练 2001-2003，验证 2008
-    #   Batch 2: 训练 2004-2006，验证 2009
-    #   Batch 3: 训练 2007，验证 2010
-    #   最终测试: 2010
-    #
-    # 优势:
-    #   1. 时间顺序训练，更符合实际预测场景
-    #   2. 每批内存占用可控（~8-10GB）
-    #   3. 充分利用历史数据，避免浪费
-    TRAIN_BATCHES = [
-        {
-            'name': 'batch1_2001-2003',
-            'train_years': [2001, 2002, 2003],
-            'val_year': 2008
-        },
-        {
-            'name': 'batch2_2004-2006',
-            'train_years': [2004, 2005, 2006],
-            'val_year': 2009
-        },
-        {
-            'name': 'batch3_2007',
-            'train_years': [2007],
-            'val_year': 2010
-        }
-    ]
+    # Checkpoint 保存频率
+    CHECKPOINT_FREQ = 50
 
-    # 最终测试年份
-    TEST_YEARS = [2010]
+    # Mini-Validation Set 大小（用于 Early Stopping 和实时监控）
+    # 按完整 Query 采样，确保 Recall 指标准确
+    MINI_VAL_SIZE = 500000
 
-    # 向后兼容的旧配置（用于单批训练）
-    TRAIN_START_YEAR = 2001
-    TRAIN_END_YEAR = 2003
-    VAL_YEARS = [2008]
+    # 日志打印频率（每 N 轮打印一次）
+    LOG_EVALUATION_FREQ = 50
 
     # --- LightGBM 参数 (CPU 极速版) ---
     LGBM_PARAMS = {
@@ -90,11 +62,11 @@ class Config:
 
         # 【速度优化核心 2】CPU 训练的神器：减少分桶
         # 默认 255，降为 63 可提升 3-5 倍速度，精度损失极小  255可以更高的精度进行学习
-        'max_bin': 255,
+        'max_bin': 63,
 
         # 【精度优化】降低学习率，增加树数量,提升精度
-        'learning_rate': 0.05,    # 原 0.1 -> 0.05 (更细致的学习)
-        'n_estimators': 8000,     # 原 1000 -> 3000 (配合低学习率)
+        'learning_rate': 0.1,    # 原 0.1 -> 0.05 (更细致的学习)
+        'n_estimators': 3000,     # 原 1000 -> 3000 (配合低学习率)
 
         # 【核心修改 2】GOSS 模式下必须移除 subsample (行采样)
         # 'subsample': 0.8,         # GOSS 不兼容，注释掉

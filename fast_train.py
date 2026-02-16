@@ -129,7 +129,13 @@ def save_checkpoint_callback(save_freq, output_dir, year_prefix):
             print_log(f"   💾 Checkpoint saved: {path.name}")
     return callback
 
-def train_batch_mode(target_end_year, batch_size_years=5, checkpoint_freq=50):
+def train_batch_mode(target_end_year, batch_size_years=None, checkpoint_freq=None):
+    # 从配置文件读取默认值
+    if batch_size_years is None:
+        batch_size_years = Config.TRAIN_BATCH_SIZE_YEARS
+    if checkpoint_freq is None:
+        checkpoint_freq = Config.CHECKPOINT_FREQ
+
     total_start = time.time()
     print("="*60)
     print(f"🚀 Batch Training Task: End Year {target_end_year}")
@@ -151,9 +157,9 @@ def train_batch_mode(target_end_year, batch_size_years=5, checkpoint_freq=50):
     df_val = load_data_batch(val_years, shuffle=False)
 
     # 【精度优化】按 Query 完整采样,不随机拆分行
-    # 构造一个极小的验证集 (20万行) 专门用于 Early Stopping 和 实时打印
+    # 构造一个极小的验证集，专门用于 Early Stopping 和 实时打印
     # 关键: 按 qid 分组,确保一个 Query 的所有样本都在验证集中
-    WATCH_SIZE = 200000
+    WATCH_SIZE = Config.MINI_VAL_SIZE
 
     if len(df_val) > WATCH_SIZE:
         print_log(f"⚡ Creating Mini-Validation Set for Speed: ~{WATCH_SIZE:,} rows")
@@ -256,9 +262,9 @@ def train_batch_mode(target_end_year, batch_size_years=5, checkpoint_freq=50):
         try:
             # 回调列表
             callbacks_list = [
-                # 核心早停参数 修改后：增加耐心到 50 或 100，或者直接注释掉，让它跑满 1000 轮
-                lgb.early_stopping(stopping_rounds=100, verbose=True),
-                lgb.log_evaluation(50), # 减少打印频率到 50
+                # 使用配置文件中的早停轮数
+                lgb.early_stopping(stopping_rounds=Config.EARLY_STOPPING_ROUNDS, verbose=True),
+                lgb.log_evaluation(Config.LOG_EVALUATION_FREQ),
                 # 添加 Checkpoint 回调
                 save_checkpoint_callback(checkpoint_freq, Config.OUTPUT_DIR, target_end_year)
             ]
@@ -317,8 +323,9 @@ def train_batch_mode(target_end_year, batch_size_years=5, checkpoint_freq=50):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--end_year', type=int, default=2020, help='Target End Year')
-    parser.add_argument('--batch_size', type=int, default=5, help='Years per batch')
-    parser.add_argument('--ckpt_freq', type=int, default=50, help='Checkpoint frequency')
+    parser.add_argument('--batch_size', type=int, default=None, help=f'Years per batch (default: {Config.TRAIN_BATCH_SIZE_YEARS} from config)')
+    parser.add_argument('--ckpt_freq', type=int, default=None, help=f'Checkpoint frequency (default: {Config.CHECKPOINT_FREQ} from config)')
     args = parser.parse_args()
-    
+
+    # 使用配置文件的默认值
     train_batch_mode(args.end_year, args.batch_size, args.ckpt_freq)
