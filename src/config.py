@@ -1,21 +1,25 @@
 import os
 
 class Config:
+    # 获取项目根目录
+    PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
     # --- 路径配置 ---
-    DB_PATH = '/data1/wxj/Recall_city_project/data/local_migration_data.db'
-    DATA_DIR = '/data1/wxj/Recall_city_project/data'
-    CITY_INFO_DIR = '/data1/wxj/Recall_city_project/data/cities_2000-2020'
-    OUTPUT_DIR = 'output'
+    DB_PATH = os.path.join(PROJECT_ROOT, 'data', 'local_migration_data.db')
+    DATA_DIR = os.path.join(PROJECT_ROOT, 'data')
+    CITY_INFO_DIR = os.path.join(PROJECT_ROOT, 'data', 'cities_2000-2020')
+    OUTPUT_DIR = os.path.join(PROJECT_ROOT, 'output')
 
     # 预处理数据的存储目录 (新)
     PROCESSED_DIR = os.path.join(OUTPUT_DIR, 'processed_ready')
-    os.makedirs(PROCESSED_DIR, exist_ok=True)
+    if not os.path.exists(PROCESSED_DIR):
+        os.makedirs(PROCESSED_DIR, exist_ok=True)
 
     # JSONL 文件路径
     # 城市详细信息现在是年度文件: cities_2000.jsonl 到 cities_2020.jsonl
-    CITY_INFO_DIR = '/data1/wxj/Recall_city_project/data/cities_2000-2020'  # 年度城市信息文件目录
-    CITY_EDGES_PATH = '/data1/wxj/Recall_city_project/data/city_edges.jsonl'    # 城市边关系（距离）
-    CITY_NODES_PATH = '/data1/wxj/Recall_city_project/data/city_nodes.jsonl'    # 城市节点（ID和名称）
+    CITY_INFO_DIR = os.path.join(PROJECT_ROOT, 'data', 'cities_2000-2020')  # 年度城市信息文件目录
+    CITY_EDGES_PATH = os.path.join(PROJECT_ROOT, 'data', 'city_edges.jsonl')    # 城市边关系（距离）
+    CITY_NODES_PATH = os.path.join(PROJECT_ROOT, 'data', 'city_nodes.jsonl')    # 城市节点（ID和名称）
 
     # --- 采样策略 (严格 1:4) ---
     # 一个 Query 总样本数 = 50
