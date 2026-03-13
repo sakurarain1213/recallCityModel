@@ -1,204 +1,221 @@
 """
-极速评估脚本 (宽表适配修复版)
-功能: 加载模型 -> 从宽表 DB 读取并展开 GT -> 构造全量候选集 -> 特征工程 -> 预测 -> 计算 Recall
-修复: 解决了 DuckDB 表结构不匹配的问题 (Rank 列不存在)
-修复: 解决了 ID 类型不匹配导致的 0% Recall 问题
+轻量版 Recall 评估脚本
+直接从 feather 文件读取已有特征 + LightGBM predict，多核并行推理。
+
+召回率计算逻辑：
+  1. 对每个 query 统一推理 top20 城市（按 score 降序）
+  2. 根据 GT 中实际有去向城市数 n（Label=1 的城市数），
+     取 pred 前 n 个城市与 GT 集合比较命中率
+  3. 这样避免了因 GT 不足 20 个而导致 recall 偏低
 """
-import gc
-import pandas as pd
-import numpy as np
-import lightgbm as lgb
-import duckdb
+
+from __future__ import annotations
+
 import argparse
-import re
+import os
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from src.config import Config
-from src.city_data import CityDataLoader
-from src.feature_pipeline import FeaturePipeline
-from src.feature_eng import extract_city_id  # 复用同一个提取函数
 
-# ------------------------------------------------------------------------------
-# 1. 核心辅助函数：读取宽表并转为长表 GT
-# ------------------------------------------------------------------------------
-def load_ground_truth(db_path, year):
-    """
-    修复版：严格提取 Int 类型的 ID  尤其注意ground truth是 top10 而不是20个都加载进来。
-    """
-    print(f"📥 Querying DuckDB for year {year}...")
-    con = duckdb.connect(str(db_path), read_only=True)
+import lightgbm as lgb
+import numpy as np
+import pandas as pd
 
-    # 查询
-    # 修改后: 只加载 Top 10 作为 Ground Truth
-    # 这样分母(GT总数)就变成了 10，Recall@10 的理论上限就是 100% 了
-    top_cols = [f"To_Top{i}" for i in range(1, 11)] 
-    cols_str = ", ".join(top_cols)
 
-    query = f"SELECT Year, Type_ID, From_City, {cols_str} FROM migration_data WHERE Year = {year}"
+# ── 与 simple_train.py 完全对齐的特征列表 ──
+FEATS = [
+    'gender', 'age_group', 'education', 'industry', 'income', 'family',
+    'geo_distance', 'dialect_distance',
+    'gdp_per_capita_ratio', 'unemployment_rate_ratio', 'housing_price_avg_ratio',
+    'rent_avg_ratio', 'daily_cost_index_ratio', 'medical_score_ratio',
+    'education_score_ratio', 'transport_convenience_ratio', 'population_total_ratio',
+    'is_same_province',
+]
 
-    try:
-        df_wide = con.execute(query).df()
-        if df_wide.empty: return pd.DataFrame()
+CATS = ['gender', 'age_group', 'education', 'industry', 'income', 'family', 'is_same_province']
 
-        # 1. 清洗 From_City (转 Int)
-        df_wide['From_City'] = df_wide['From_City'].apply(extract_city_id).astype('int16')
+PROCESSED_DIR = Path("output/processed_ready")
+DEFAULT_MODEL = Path("output/models/model_fast.txt")
 
-        # 2. Melt
-        df_long = pd.melt(df_wide, id_vars=['Year', 'Type_ID', 'From_City'],
-                          value_vars=top_cols, value_name='To_City_Raw')
 
-        # 3. 清洗 To_City (转 Int)
-        # 这一步是之前的痛点：To_Top1 可能是 "成都(5101)"
-        df_long = df_long.dropna(subset=['To_City_Raw'])
-        df_long['To_City'] = df_long['To_City_Raw'].apply(extract_city_id)
+def load_year_data(year: int, sample_n: int | None = None, seed: int = 42) -> pd.DataFrame:
+    """从 feather 加载单年数据，可选采样 sample_n 个 query。"""
+    fp = PROCESSED_DIR / f"processed_{year}.feather"
+    if not fp.exists():
+        raise FileNotFoundError(f"Feather not found: {fp}")
 
-        # 过滤无效ID
-        df_long = df_long[df_long['To_City'] > 0].copy()
-        df_long['To_City'] = df_long['To_City'].astype('int16')
+    cols_needed = FEATS + ['qid', 'To_City', 'Label', 'Rank']
+    df = pd.read_feather(fp, columns=cols_needed)
 
-        # 去重 (同一Query可能多个Rank指向同一城市? 一般不会，但防万一)
-        final_df = df_long[['Year', 'Type_ID', 'From_City', 'To_City']].drop_duplicates()
+    if sample_n is not None and sample_n > 0:
+        unique_qids = df['qid'].unique()
+        if len(unique_qids) > sample_n:
+            rng = np.random.default_rng(seed)
+            sampled_qids = rng.choice(unique_qids, size=sample_n, replace=False)
+            df = df[df['qid'].isin(set(sampled_qids))]
 
-        return final_df
-    except Exception as e:
-        print(f"❌ DB Error: {e}")
-        return pd.DataFrame()
-    finally:
-        con.close()
+    return df
 
-# ------------------------------------------------------------------------------
-# 2. 核心评估逻辑
-# ------------------------------------------------------------------------------
 
-def run_main(year, model_path, sample_size):
-    # 1. 加载资源 (CityData 会强制 ID 为 Int)
-    loader = CityDataLoader(Config.DATA_DIR).load_all()
-    pipeline = FeaturePipeline(loader, data_dir=Config.PROCESSED_DIR)
-
-    # 【关键修改】 路径检查
-    if not model_path:
-        print("❌ Error: No model path provided.")
-        return
-
-    path_obj = Path(model_path)
-    if not path_obj.exists():
-        print(f"❌ Error: Model file does not exist at: {model_path}")
-        return
-        
-    print(f"📂 Loading Model from: {path_obj.absolute()}")
-    model = lgb.Booster(model_file=str(path_obj)) # 确保转为 str
-    model_feats = model.feature_name()
-    print(f"✅ Model loaded successfully ({len(model_feats)} feats)")
-
-    # 2. 获取 GT (现在全是 Int)
-    df_true = load_ground_truth(Config.DB_PATH, year)
-    if df_true.empty:
-        print("❌ No ground truth data found.")
-        return
-
-    print(f"   ✓ Extracted {len(df_true):,} valid ground truth pairs")
-
-    # 采样 (可选)
-    queries = df_true[['Year', 'Type_ID', 'From_City']].drop_duplicates()
-    if sample_size is not None and len(queries) > sample_size:
-        print(f"⚡ Sampling {sample_size} queries from {len(queries)}...")
-        queries = queries.sample(n=sample_size, random_state=42)
-        print(f"   ✅ Using {sample_size} sampled queries for evaluation")
-    else:
-        print(f"📊 Full evaluation: {len(queries)} queries (no sampling)")
-
-    # 3. 构造候选集 (候选 ID 必须是 Int)
-    print("🔨 Generating Candidates...")
-    all_cities = loader.get_city_ids()  # 这是一个 Int List
-    
-    # 笛卡尔积
-    queries = queries.copy()
-    queries['key'] = 1
-    targets = pd.DataFrame({'To_City': all_cities, 'key': 1})  # To_City 是 Int
-    candidates = pd.merge(queries, targets, on='key').drop('key', axis=1)
-    
-    # 排除 From == To
-    candidates = candidates[candidates['From_City'] != candidates['To_City']].copy()
-    
-    # 4. 特征工程
-    print("✨ Feature Engineering...")
-    candidates['Flow_Count'] = 0
-    df_feats = pipeline.transform(candidates.copy(), year, mode='predict', verbose=False)
-
-    # 准备 X
-    X = pd.DataFrame(index=df_feats.index)
-    for f in model_feats:
-        X[f] = df_feats[f] if f in df_feats.columns else 0.0
-
-    # 转 float32
-    for c in X.columns:
-        if X[c].dtype == 'float64': X[c] = X[c].astype('float32')
-
-    # 5. 预测
-    print("🔮 Predicting...")
+def predict_chunk(model_path: str, chunk_df: pd.DataFrame) -> pd.DataFrame:
+    """在子进程中加载模型并对一个 chunk 进行 predict，返回 (qid, To_City, score)。"""
+    model = lgb.Booster(model_file=model_path)
+    X = chunk_df[FEATS].copy()
+    for c in CATS:
+        if c in X.columns:
+            X[c] = X[c].astype('category')
     scores = model.predict(X)
-    candidates['score'] = scores
+    return pd.DataFrame({
+        'qid': chunk_df['qid'].values,
+        'To_City': chunk_df['To_City'].values,
+        'score': scores,
+    })
 
-    # 6. 计算指标
-    print("📉 Calculating Metrics...")
-    gt_set = set(zip(df_true['Type_ID'], df_true['From_City'], df_true['To_City']))
-    
-    candidates['rank'] = candidates.groupby(['Type_ID', 'From_City'])['score'].rank(method='first', ascending=False)
-    top_preds = candidates[candidates['rank'] <= 20].copy()
-    
-    top_preds['is_hit'] = top_preds.apply(lambda x: (x['Type_ID'], x['From_City'], x['To_City']) in gt_set, axis=1)
-    
-    hits = top_preds.groupby(['Type_ID', 'From_City']).apply(
-        lambda x: pd.Series({
-            'hit_1': x[x['rank'] <= 1]['is_hit'].sum(),
-            'hit_5': x[x['rank'] <= 5]['is_hit'].sum(),
-            'hit_10': x[x['rank'] <= 10]['is_hit'].sum(),
-            'hit_20': x[x['rank'] <= 20]['is_hit'].sum()
+
+def parallel_predict(model_path: str, df: pd.DataFrame, n_workers: int) -> pd.DataFrame:
+    """多进程并行推理，按 qid 分 chunk 分发到各 worker。"""
+    # 按 qid 分组，均匀分配到 n_workers 个 chunk
+    unique_qids = df['qid'].unique()
+    qid_splits = np.array_split(unique_qids, n_workers)
+
+    chunks = []
+    for qid_subset in qid_splits:
+        if len(qid_subset) == 0:
+            continue
+        mask = df['qid'].isin(set(qid_subset))
+        chunks.append(df[mask].copy())
+
+    if len(chunks) == 1:
+        return predict_chunk(model_path, chunks[0])
+
+    results = []
+    with ProcessPoolExecutor(max_workers=len(chunks)) as executor:
+        futures = {executor.submit(predict_chunk, model_path, c): i for i, c in enumerate(chunks)}
+        for future in as_completed(futures):
+            results.append(future.result())
+
+    return pd.concat(results, ignore_index=True)
+
+
+def compute_recall(df: pd.DataFrame, pred_df: pd.DataFrame, top_infer: int = 20) -> pd.DataFrame:
+    """
+    计算自适应召回率。
+    对每个 query:
+      - GT 集合 = Label==1 的 To_City 集合，大小为 n
+      - Pred 集合 = score 降序排列的前 n 个 To_City
+      - recall = |Pred ∩ GT| / n
+    """
+    # 构建 GT: 每个 qid 的正样本城市集合
+    gt = df[df['Label'] == 1].groupby('qid')['To_City'].apply(set).to_dict()
+    gt_sizes = {qid: len(cities) for qid, cities in gt.items()}
+
+    # 构建 Pred: 先取 top_infer，再按 GT 大小截断
+    pred_df = pred_df.sort_values(['qid', 'score'], ascending=[True, False])
+    pred_ranked = pred_df.groupby('qid').head(top_infer)
+
+    rows = []
+    for qid, group in pred_ranked.groupby('qid'):
+        gt_set = gt.get(qid, set())
+        n = len(gt_set)
+        if n == 0:
+            continue
+        # 取 pred 前 n 个
+        pred_top_n = set(group['To_City'].iloc[:n].values)
+        hits = len(pred_top_n & gt_set)
+        rows.append({
+            'qid': qid,
+            'gt_size': n,
+            'hits': hits,
+            'recall': hits / n,
         })
-    ).reset_index()
-    
-    gt_counts = df_true.groupby(['Type_ID', 'From_City']).size().reset_index(name='total_true')
-    res = pd.merge(hits, gt_counts, on=['Type_ID', 'From_City'], how='left').fillna(0)
-    res['total_true'] = res['total_true'].replace(0, 1)
-    
-    r1 = (res['hit_1'] / res['total_true']).mean()
-    r5 = (res['hit_5'] / res['total_true']).mean()
-    r10 = (res['hit_10'] / res['total_true']).mean()
-    r20 = (res['hit_20'] / res['total_true']).mean()
-    
-    print("\n" + "="*40)
-    print(f"📊 Evaluation Results for Year {year}")
-    print(f"🤖 Model: {Path(model_path).name}")
-    print("="*40)
-    print(f"Queries Evaluated : {len(res)}")
-    print(f"Avg GT per Query: {res['total_true'].mean():.2f}")
-    print("-" * 30)
-    print(f"Recall@1  : {r1:.2%}")
-    print(f"Recall@5  : {r5:.2%}")
-    print(f"Recall@10 : {r10:.2%}")
-    print(f"Recall@20 : {r20:.2%}")
-    print("="*40)
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--year', type=int, required=True, help="Year to evaluate (required)")
-    parser.add_argument('--model', type=str, default=None, help="Specific path to model checkpoint")
-    parser.add_argument('--sample', type=int, default=None, help="Number of queries to sample (default: full evaluation)")
+    return pd.DataFrame(rows)
+
+
+def evaluate_year(model_path: str, year: int, sample_n: int | None,
+                  n_workers: int, seed: int = 42) -> dict:
+    """评估单年，返回统计结果字典。"""
+    t0 = time.time()
+    print(f"\n{'='*60}")
+    print(f"[Year {year}] Loading data...")
+    df = load_year_data(year, sample_n=sample_n, seed=seed)
+    n_queries = df['qid'].nunique()
+    print(f"  Loaded {len(df):,} rows, {n_queries:,} queries")
+
+    print(f"[Year {year}] Predicting with {n_workers} workers...")
+    pred_df = parallel_predict(model_path, df, n_workers)
+
+    print(f"[Year {year}] Computing adaptive recall...")
+    recall_df = compute_recall(df, pred_df, top_infer=20)
+
+    avg_recall = recall_df['recall'].mean()
+    avg_gt_size = recall_df['gt_size'].mean()
+    avg_hits = recall_df['hits'].mean()
+    elapsed = time.time() - t0
+
+    print(f"[Year {year}] Done in {elapsed:.1f}s")
+    print(f"  Queries evaluated: {len(recall_df)}")
+    print(f"  Avg GT cities:     {avg_gt_size:.2f}")
+    print(f"  Avg hits:          {avg_hits:.2f}")
+    print(f"  Avg Recall:        {avg_recall:.4f} ({avg_recall*100:.2f}%)")
+
+    return {
+        'year': year,
+        'n_queries': len(recall_df),
+        'avg_gt_size': avg_gt_size,
+        'avg_hits': avg_hits,
+        'recall': avg_recall,
+        'elapsed_s': elapsed,
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(description="轻量版 Recall 评估")
+    parser.add_argument("--model", type=str, default=str(DEFAULT_MODEL))
+    parser.add_argument("--years", nargs="+", type=int, default=[2019, 2020])
+    parser.add_argument("--sample-n", type=int, default=1000,
+                        help="每年采样 query 数，0 表示全量")
+    parser.add_argument("--workers", type=int, default=0,
+                        help="并行 worker 数，0=自动(CPU核心数)")
+    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
-    # 自动查找模型 (仅当未指定时)
-    if args.model is None:
-        print("⚠️ No model path provided, trying to auto-find latest model...")
-        p = Path(Config.OUTPUT_DIR) / f"lgb_batch_end_{args.year}.txt"
-        if not p.exists():
-             models = list(Path(Config.OUTPUT_DIR).glob("lgb_batch_end_*.txt"))
-             if models:
-                 p = max(models, key=lambda f: f.stat().st_mtime)
-        args.model = str(p)
+    model_path = args.model
+    if not Path(model_path).exists():
+        raise FileNotFoundError(f"Model not found: {model_path}")
 
-    print(f"\n🎯 Evaluation Configuration:")
-    print(f"   Year: {args.year}")
-    print(f"   Model: {args.model}")
-    print(f"   Sample: {args.sample if args.sample else 'Full (all queries)'}")
-    print()
+    n_workers = args.workers if args.workers > 0 else os.cpu_count()
+    sample_n = args.sample_n if args.sample_n > 0 else None
 
-    run_main(args.year, args.model, args.sample)
+    print(f"Model:   {model_path}")
+    print(f"Years:   {args.years}")
+    print(f"Sample:  {sample_n or 'ALL'} queries/year")
+    print(f"Workers: {n_workers}")
+
+    results = []
+    for year in args.years:
+        r = evaluate_year(model_path, year, sample_n, n_workers, args.seed)
+        results.append(r)
+
+    # 汇总
+    print(f"\n{'='*60}")
+    print("Summary:")
+    print(f"{'Year':<8} {'Queries':<10} {'AvgGT':<8} {'AvgHits':<10} {'Recall':<12} {'Time':<8}")
+    print("-" * 56)
+    total_queries = 0
+    weighted_recall_sum = 0.0
+    for r in results:
+        print(f"{r['year']:<8} {r['n_queries']:<10} {r['avg_gt_size']:<8.2f} "
+              f"{r['avg_hits']:<10.2f} {r['recall']:<12.4f} {r['elapsed_s']:<8.1f}s")
+        total_queries += r['n_queries']
+        weighted_recall_sum += r['recall'] * r['n_queries']
+
+    if total_queries > 0:
+        overall = weighted_recall_sum / total_queries
+        print("-" * 56)
+        print(f"{'ALL':<8} {total_queries:<10} {'':8} {'':10} {overall:<12.4f}")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    main()
