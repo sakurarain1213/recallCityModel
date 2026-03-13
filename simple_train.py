@@ -5,6 +5,7 @@ import lightgbm as lgb
 import numpy as np
 import pandas as pd
 from pathlib import Path
+
 #  cd /data1/wxj/Recall_city_project/ && uv run simple_train.py
 # ================= 基础配置 =================
 PROCESSED_DIR = Path("output/processed_ready")
@@ -167,6 +168,29 @@ def main():
     print("\nCalculating sample weights...")
     train_weights = calculate_sample_weights(df_train)
 
+    # 🌟 修复点：将 params 提前定义！
+    # 因为 max_bin 是构建 Dataset 直方图时的底层参数，必须在 construct() 之前让 Dataset 知道。
+    params = {
+        'objective': 'binary',
+        'metric': ['binary_logloss', 'auc'],
+        'boosting_type': 'gbdt',
+        'learning_rate': 0.08,
+        'num_leaves': 63,
+        'max_depth': 8,
+        'n_estimators': 2000,     # 全局最大轮次 目前测试 1k轮=60min 且没有触发早停 因此依然有提升空间
+        
+        # 🚀 性能与速度优化
+        'n_jobs': 24,             # 降至 24 线程，减少调度开销
+        'num_threads': 24,        # 明确传递底层 OpenMP 线程数
+        'max_bin': 63,            # 直方图压缩，提升构建速度，减少缓存未命中
+        'bagging_fraction': 0.8,  # 行采样
+        'bagging_freq': 1,        # 配合 bagging_fraction 使用，每 1 轮进行一次采样
+        'feature_fraction': 0.8,  # 列采样
+        
+        'verbosity': -1,
+        # 'two_round': True,      # 如果依然 OOM，把这行注释打开（两阶段加载，能再降内存，但稍慢）
+    }
+
     # 3. 构建 LGBM 数据集
     print("Constructing LightGBM Datasets...")
     train_ds = lgb.Dataset(
@@ -174,7 +198,8 @@ def main():
         label=df_train['Label'],
         weight=train_weights,
         categorical_feature=CATS,
-        free_raw_data=True  # 🚀 内存优化 2：必须设为 True！允许 LGBM 在构建后丢弃原始数据
+        params=params,          # 🌟 修复点：传入 params，告诉底层按照 max_bin=63 进行数据分箱
+        free_raw_data=True      # 🚀 内存优化 2：允许 LGBM 在构建后丢弃原始数据
     )
     
     val_ds = lgb.Dataset(
@@ -182,6 +207,7 @@ def main():
         label=df_val['Label'],
         categorical_feature=CATS,
         reference=train_ds,
+        params=params,          # 🌟 修复点：验证集同样传入 params
         free_raw_data=True
     )
 
@@ -196,26 +222,8 @@ def main():
     del train_weights
     gc.collect()
 
-    # 4. 训练参数 (充分利用 40 核心)
-    params = {
-        'objective': 'binary',
-        'metric': ['binary_logloss', 'auc'],
-        'boosting_type': 'gbdt',
-        'learning_rate': 0.08,
-        'num_leaves': 63,
-        'max_depth': 8,
-        'n_estimators': 1000,
-        
-        # 🚀 速度优化：强制拉满 40 核心
-        'n_jobs': 40,            
-        'num_threads': 40,        # 明确传递底层 OpenMP 线程数
-        
-        'verbosity': -1,
-        # 'two_round': True,      # 如果依然 OOM，把这行注释打开（两阶段加载，能再降内存，但稍慢）
-    }
-
-    # 5. 训练模型
-    print("\nTraining started (Utilizing 40 Cores)...")
+    # 4. 训练模型
+    print("\nTraining started (Utilizing 24 Cores)...")
     start_time = time.time()
     
     # 实例化自定义的 checkpoint 回调，每 10 轮保存一次
@@ -224,24 +232,24 @@ def main():
     model = lgb.train(
         params,
         train_ds,
-        valid_sets=[train_ds, val_ds],
-        valid_names=['train', 'val'],
+        valid_sets=[val_ds],          # 彻底移除 train_ds 评估，跳过无意义的大量数据打分和排序
+        valid_names=['val'],          # 同步修改评估集名称
         callbacks=[
             lgb.early_stopping(stopping_rounds=100, verbose=True),
-            lgb.log_evaluation(10),  # 🎯 修改点：改为每 10 轮打印一次
-            ckpt_callback            # 🎯 修改点：加入 Checkpoint 回调
+            lgb.log_evaluation(10),  # 每 10 轮打印一次
+            ckpt_callback            # 加入 Checkpoint 回调
         ]
     )
     print(f"Training finished in {(time.time() - start_time)/60:.2f} minutes.")
 
-    # 6. 保存模型
+    # 5. 保存模型
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     target_year = TEST_YEARS[0] if TEST_YEARS else VAL_YEARS[0]
     model_path = OUTPUT_DIR / f'model_{target_year}_fast.txt'
     model.save_model(str(model_path))
     print(f"Final Model saved to {model_path}")
 
-    # 7. 打印特征重要性
+    # 6. 打印特征重要性
     imp = pd.DataFrame({'feature': FEATS, 'importance': model.feature_importance('gain')})
     print("\n🏆 Top Features by Gain:")
     print(imp.sort_values('importance', ascending=False).to_string(index=False))
