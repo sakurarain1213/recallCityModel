@@ -121,14 +121,19 @@ def load_data(years: list, sample_ratio: float = 1.0, random_seed: int = 42) -> 
     return final_df
 
 def calculate_sample_weights(df: pd.DataFrame) -> np.ndarray:
-    """计算样本权重：让模型重点关注头部正样本"""
+    """
+    计算样本权重：正负比 1:23.7，需要大幅提升正样本权重来对抗不平衡。
+    基准思路：负样本=1，正样本基础权重≈正负比(~24)，头部Rank额外加码。
+    这样在 loss 中正样本的总贡献与负样本大致持平，再由 Rank 梯度引导排序。
+    """
     weights = np.ones(len(df), dtype=np.float32)
     pos_mask = df['Label'] == 1
     rank = df['Rank']
-    
-    weights[pos_mask & (rank <= 3)] = 15.0
-    weights[pos_mask & (rank > 3) & (rank <= 10)] = 8.0
-    weights[pos_mask & (rank > 10) & (rank <= 20)] = 5.0
+
+    # 正样本按 Rank 分级加权，基础对齐正负比后再按重要性递增
+    weights[pos_mask & (rank <= 3)]  = 50.0   # 最重要的头部城市
+    weights[pos_mask & (rank > 3)  & (rank <= 10)] = 35.0
+    weights[pos_mask & (rank > 10) & (rank <= 20)] = 24.0   # 基础对齐正负比
     return weights
 
 class CheckpointCallback:
@@ -154,7 +159,7 @@ def main():
     VAL_YEARS   = [2017, 2018]
     TEST_YEARS  = [2019, 2020]
 
-    SAMPLE_RATIO = 0.1
+    SAMPLE_RATIO = 0.2
 
     print("="*60)
     print(f"🚀 LightGBM Fast & Memory-Optimized Training Session")
@@ -174,21 +179,25 @@ def main():
         'objective': 'binary',
         'metric': ['binary_logloss', 'auc'],
         'boosting_type': 'gbdt',
-        'learning_rate': 0.08,
-        'num_leaves': 63,
-        'max_depth': 8,
-        'n_estimators': 2000,     # 全局最大轮次 目前测试 1k轮=60min 且没有触发早停 因此依然有提升空间
-        
+        'learning_rate': 0.05,        # 降低学习率，配合更多轮次学得更细
+        'num_leaves': 127,            # 加大叶子数，增强表达能力
+        'max_depth': 10,              # 适度加深
+        'n_estimators': 3000,         # 增加轮次，2-3小时可接受
+
         # 🚀 性能与速度优化
-        'n_jobs': 24,             # 降至 24 线程，减少调度开销
-        'num_threads': 24,        # 明确传递底层 OpenMP 线程数
-        'max_bin': 63,            # 直方图压缩，提升构建速度，减少缓存未命中
-        'bagging_fraction': 0.8,  # 行采样
-        'bagging_freq': 1,        # 配合 bagging_fraction 使用，每 1 轮进行一次采样
-        'feature_fraction': 0.8,  # 列采样
-        
+        'n_jobs': 36,
+        'num_threads': 36,
+        'max_bin': 127,               # 配合更多叶子，提升分箱精度
+        'bagging_fraction': 0.8,
+        'bagging_freq': 1,
+        'feature_fraction': 0.8,
+
+        # 正则化：防止更深的树过拟合
+        'lambda_l1': 0.1,
+        'lambda_l2': 1.0,
+        'min_child_samples': 100,     # 叶子最少样本数，防止过拟合
+
         'verbosity': -1,
-        # 'two_round': True,      # 如果依然 OOM，把这行注释打开（两阶段加载，能再降内存，但稍慢）
     }
 
     # 3. 构建 LGBM 数据集
@@ -243,9 +252,9 @@ def main():
     print(f"Training finished in {(time.time() - start_time)/60:.2f} minutes.")
 
     # 5. 保存模型
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    target_year = TEST_YEARS[0] if TEST_YEARS else VAL_YEARS[0]
-    model_path = OUTPUT_DIR / f'model_{target_year}_fast.txt'
+    models_dir = OUTPUT_DIR / "models"
+    models_dir.mkdir(parents=True, exist_ok=True)
+    model_path = models_dir / 'model_fast.txt'
     model.save_model(str(model_path))
     print(f"Final Model saved to {model_path}")
 
