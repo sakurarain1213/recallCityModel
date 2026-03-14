@@ -159,7 +159,8 @@ def main():
     VAL_YEARS   = [2017, 2018]
     TEST_YEARS  = [2019, 2020]
 
-    SAMPLE_RATIO = 0.2
+    # 核心指标
+    SAMPLE_RATIO = 0.4
 
     print("="*60)
     print(f"🚀 LightGBM Fast & Memory-Optimized Training Session")
@@ -182,7 +183,7 @@ def main():
         'learning_rate': 0.05,        # 降低学习率，配合更多轮次学得更细
         'num_leaves': 127,            # 加大叶子数，增强表达能力
         'max_depth': 10,              # 适度加深
-        'n_estimators': 3000,         # 增加轮次，2-3小时可接受
+        'n_estimators': 5000,         # 增加轮次，2-3小时可接受
 
         # 🚀 性能与速度优化
         'n_jobs': 36,
@@ -232,7 +233,7 @@ def main():
     gc.collect()
 
     # 4. 训练模型
-    print("\nTraining started (Utilizing 24 Cores)...")
+    print("\nTraining started (Utilizing 36 Cores)...")
     start_time = time.time()
     
     # 实例化自定义的 checkpoint 回调，每 10 轮保存一次
