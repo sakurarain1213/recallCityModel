@@ -1,268 +1,406 @@
+"""
+LightGBM 召回模型训练脚本 (v2 - 丰富特征版)
+
+架构:
+  base_ready/base_YYYY.feather  — 人口统计 + 标签 (精简, ~150MB/年)
+  city_pair_cache/city_pairs_YYYY.parquet — 城市对特征 (~50列, ~5MB/年)
+  训练时动态 join + 构建交叉特征
+
+运行: cd /data1/wxj/Recall_city_project/ && uv run simple_train.py
+依赖: output/base_ready/, data/city_pair_cache/
+"""
+
 import os
 import time
-import gc  # 引入垃圾回收机制
+import gc
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
 from pathlib import Path
 
-#  cd /data1/wxj/Recall_city_project/ && uv run simple_train.py
-# ================= 基础配置 =================
-PROCESSED_DIR = Path("output/processed_ready")
+# ================= 路径配置 =================
+BASE_DIR = Path("output/base_ready")
+CACHE_DIR = Path("data/city_pair_cache")
 OUTPUT_DIR = Path("output")
 
-FEATS = [
-    'gender', 'age_group', 'education', 'industry', 'income', 'family',
-    'geo_distance', 'dialect_distance',
-    'gdp_per_capita_ratio', 'unemployment_rate_ratio', 'housing_price_avg_ratio',
-    'rent_avg_ratio', 'daily_cost_index_ratio', 'medical_score_ratio',
-    'education_score_ratio', 'transport_convenience_ratio', 'population_total_ratio',
-    'is_same_province'
+# ================= 特征定义 (训练/评估共享) =================
+# 人口统计特征 (类别型)
+PERSON_CATS = ['gender', 'age_group', 'education', 'industry', 'income', 'family']
+
+# 城市对 — 比率特征
+RATIO_FEATS = [
+    'gdp_per_capita_ratio', 'cpi_index_ratio', 'unemployment_rate_ratio',
+    'agri_share_ratio', 'agri_wage_ratio', 'agri_vacancy_ratio',
+    'mfg_share_ratio', 'mfg_wage_ratio', 'mfg_vacancy_ratio',
+    'trad_svc_share_ratio', 'trad_svc_wage_ratio', 'trad_svc_vacancy_ratio',
+    'mod_svc_share_ratio', 'mod_svc_wage_ratio', 'mod_svc_vacancy_ratio',
+    'housing_price_avg_ratio', 'rent_avg_ratio', 'daily_cost_index_ratio',
+    'medical_score_ratio', 'education_score_ratio', 'transport_convenience_ratio',
+    'avg_commute_mins_ratio', 'population_total_ratio',
+    'age_0_17_ratio', 'age_18_34_ratio', 'age_35_54_ratio',
+    'age_55_64_ratio', 'age_65_plus_ratio', 'sex_ratio_ratio', 'area_sqkm_ratio',
 ]
 
-CATS = ['gender', 'age_group', 'education', 'industry', 'income', 'family', 'is_same_province']
+# 城市对 — 差值特征
+DIFF_FEATS = [
+    'gdp_per_capita_diff', 'housing_price_avg_diff', 'rent_avg_diff',
+    'agri_wage_diff', 'mfg_wage_diff', 'trad_svc_wage_diff', 'mod_svc_wage_diff',
+    'agri_vacancy_diff', 'mfg_vacancy_diff', 'trad_svc_vacancy_diff', 'mod_svc_vacancy_diff',
+]
+
+# 城市对 — 绝对特征
+ABS_FEATS = [
+    'to_tier', 'to_population_log', 'to_gdp_per_capita',
+    'from_tier', 'from_population_log', 'tier_diff',
+]
+
+# 社会网络 + 距离
+NET_DIST_FEATS = [
+    'migrant_stock_from_to',
+    'geo_distance', 'dialect_distance', 'is_same_province',
+]
+
+# 交叉特征名 (动态构建)
+CROSS_FEATS = [
+    'industry_x_matched_wage_ratio',
+    'industry_x_matched_vacancy_ratio',
+    'education_x_tier_diff',
+    'income_x_gdp_ratio',
+    'age_x_housing_ratio',
+    'family_x_edu_score_ratio',
+]
+
+# 所有类别型特征
+CATS = PERSON_CATS + ['is_same_province', 'to_tier', 'from_tier']
+
+# 最终特征列表 (训练 & 评估共用)
+FEATS = (
+    PERSON_CATS + RATIO_FEATS + DIFF_FEATS + ABS_FEATS + NET_DIST_FEATS + CROSS_FEATS
+)
+
+# cache parquet 中需要 join 的列 (排除 from_city, to_city)
+CACHE_FEAT_COLS = RATIO_FEATS + DIFF_FEATS + ABS_FEATS + NET_DIST_FEATS
 
 
-def load_data(years: list, sample_ratio: float = 1.0, random_seed: int = 42) -> pd.DataFrame:
-    """加载数据，预分配内存 + 零拷贝填充，彻底跳过 pd.concat"""
-    print(f"Loading data for years: {years} | Query Sample Ratio: {sample_ratio*100}%")
+def load_cache_for_year(year: int) -> pd.DataFrame:
+    """加载单年城市对 cache, 返回 (from_city, to_city, ...features) DataFrame"""
+    path = CACHE_DIR / f"city_pairs_{year}.parquet"
+    if not path.exists():
+        raise FileNotFoundError(f"Cache not found: {path}")
+    cols = ['from_city', 'to_city'] + CACHE_FEAT_COLS
+    df = pd.read_parquet(path, columns=cols)
+    df['from_city'] = df['from_city'].astype(np.int32)
+    df['to_city'] = df['to_city'].astype(np.int32)
+    return df
 
-    keep_cols = sorted(set(FEATS + ['Label', 'Rank', 'qid']))
 
-    # ── Pass 1: 只读 qid 列，统计每年采样后的行数 ──
-    print("Pass 1: Counting rows per year...")
-    year_row_counts = []
-    year_files = []
+def build_cross_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    构建人×城市交叉特征 (向量化, 就地修改)。
+    行业匹配: 根据人的 industry 编码选择对应行业的 wage/vacancy ratio。
+    """
+    industry = df['industry'].values if hasattr(df['industry'], 'values') else df['industry'].cat.codes.values
+
+    # industry: 0=Agri, 1=Mfg, 2=TradSvc, 3=ModSvc
+    wage_cols = ['agri_wage_ratio', 'mfg_wage_ratio', 'trad_svc_wage_ratio', 'mod_svc_wage_ratio']
+    vacancy_cols = ['agri_vacancy_ratio', 'mfg_vacancy_ratio', 'trad_svc_vacancy_ratio', 'mod_svc_vacancy_ratio']
+
+    wage_arr = df[wage_cols].values.astype(np.float32)    # (N, 4)
+    vacancy_arr = df[vacancy_cols].values.astype(np.float32)
+
+    ind_idx = np.clip(industry.astype(int), 0, 3)
+    rows = np.arange(len(df))
+
+    df['industry_x_matched_wage_ratio'] = wage_arr[rows, ind_idx]
+    df['industry_x_matched_vacancy_ratio'] = vacancy_arr[rows, ind_idx]
+
+    # education × tier_diff
+    edu = df['education'].values if hasattr(df['education'], 'values') else df['education'].cat.codes.values
+    df['education_x_tier_diff'] = edu.astype(np.float32) * df['tier_diff'].values.astype(np.float32)
+
+    # income × gdp_ratio
+    inc = df['income'].values if hasattr(df['income'], 'values') else df['income'].cat.codes.values
+    df['income_x_gdp_ratio'] = inc.astype(np.float32) * df['gdp_per_capita_ratio'].values
+
+    # age × housing_ratio
+    age = df['age_group'].values if hasattr(df['age_group'], 'values') else df['age_group'].cat.codes.values
+    df['age_x_housing_ratio'] = age.astype(np.float32) * df['housing_price_avg_ratio'].values
+
+    # family × education_score_ratio
+    fam = df['family'].values if hasattr(df['family'], 'values') else df['family'].cat.codes.values
+    df['family_x_edu_score_ratio'] = fam.astype(np.float32) * df['education_score_ratio'].values
+
+    return df
+
+
+# ================= 困难负样本城市池 (Tier 1+2, 高吸引力城市) =================
+HARD_NEG_CITIES_SET = {
+    # 一线城市 (Tier 1)
+    1100, 3100, 4401, 4403,
+    
+    # 新一线城市 (New Tier 1)
+    1200, 3201, 3205, 3301, 3302, 3401, 3702, 4101, 4201, 4301, 
+    4406, 4419, 5000, 5101, 6101,
+    
+    # 二线核心城市 (Tier 2)
+    1301, 1401, 2101, 2102, 2201, 2301, 3202, 3203, 3204, 3206,
+    3303, 3304, 3306, 3307, 3310, 3501, 3502, 3505, 3601, 3701,
+    3706, 3707, 3713, 4404, 4413, 4420, 4501, 4601, 5201, 5301, 6501
+}
+
+# 负采样参数 (可调)
+N_HARD_NEG = 30   # 每个 query 最多保留的困难负样本数
+N_RAND_NEG = 30   # 每个 query 的随机负样本数
+
+
+def _vectorized_neg_sample(base: pd.DataFrame, random_seed: int) -> pd.DataFrame:
+    """
+    向量化负采样: 不用 groupby, 用布尔 mask 实现。
+    策略: 保留全部正样本 + 困难负样本(随机N_HARD_NEG个) + 随机负样本(N_RAND_NEG个)
+    """
+    rng = np.random.default_rng(random_seed)
+
+    label = base['Label'].values
+    to_city = base['To_City'].values
+
+    is_pos = (label == 1)
+    is_neg = (label != 1)
+    is_hard_city = np.isin(to_city, list(HARD_NEG_CITIES_SET))
+    is_hard_neg = is_neg & is_hard_city
+    is_rand_neg = is_neg & (np.logical_not(is_hard_city))
+
+    # 正样本: 全部保留
+    keep = is_pos.copy()
+
+    # 困难负样本: 每个 qid 最多 N_HARD_NEG 个
+    # 用随机数 + 组内排名实现, 避免 groupby
+    hard_idx = np.where(is_hard_neg)[0]
+    if len(hard_idx) > 0:
+        qids_hard = base['qid'].values[hard_idx]
+        # 给每个困难负样本一个随机排名
+        rand_rank = rng.random(len(hard_idx))
+        # 按 qid 分组, 取每组前 N_HARD_NEG 个
+        hard_df = pd.DataFrame({'qid': qids_hard, 'rank': rand_rank, 'orig_idx': hard_idx})
+        hard_df['grp_rank'] = hard_df.groupby('qid')['rank'].rank(method='first')
+        selected_hard = hard_df[hard_df['grp_rank'] <= N_HARD_NEG]['orig_idx'].values
+        keep[selected_hard] = True
+
+    # 随机负样本: 每个 qid N_RAND_NEG 个
+    rand_idx = np.where(is_rand_neg)[0]
+    if len(rand_idx) > 0:
+        qids_rand = base['qid'].values[rand_idx]
+        rand_rank = rng.random(len(rand_idx))
+        rand_df = pd.DataFrame({'qid': qids_rand, 'rank': rand_rank, 'orig_idx': rand_idx})
+        rand_df['grp_rank'] = rand_df.groupby('qid')['rank'].rank(method='first')
+        selected_rand = rand_df[rand_df['grp_rank'] <= N_RAND_NEG]['orig_idx'].values
+        keep[selected_rand] = True
+
+    return base[keep].reset_index(drop=True)
+
+
+def _process_single_year(year: int, sample_ratio: float, random_seed: int,
+                         neg_sample: bool = True):
+    """加载单年: base feather → query采样 → 负采样 → merge cache → 交叉特征"""
+    base_path = BASE_DIR / f"base_{year}.feather"
+    if not base_path.exists():
+        return None
+
+    base = pd.read_feather(base_path)
+
+    # query 级采样
+    if 0.0 < sample_ratio < 1.0:
+        unique_qids = base['qid'].unique()
+        rng = np.random.default_rng(random_seed)
+        n_sample = int(len(unique_qids) * sample_ratio)
+        sampled = set(rng.choice(unique_qids, size=n_sample, replace=False))
+        base = base[base['qid'].isin(sampled)]
+
+    # 负采样 (训练时启用, 评估时不启用)
+    if neg_sample:
+        base = _vectorized_neg_sample(base, random_seed + year)
+        gc.collect()
+
+    # merge cache (cache 只有 11.3 万行, 很小)
+    cache = load_cache_for_year(year)
+    base = base.merge(
+        cache,
+        left_on=['From_City', 'To_City'],
+        right_on=['from_city', 'to_city'],
+        how='left',
+    )
+    base.drop(columns=['from_city', 'to_city'], inplace=True)
+    del cache
+
+    # 交叉特征
+    base = build_cross_features(base)
+
+    # 填充缺失
+    for col in CACHE_FEAT_COLS + CROSS_FEATS:
+        if col in base.columns:
+            base[col] = base[col].fillna(0).astype(np.float32)
+
+    return base
+
+
+def load_data(years: list, sample_ratio: float = 1.0, random_seed: int = 42,
+              neg_sample: bool = True) -> pd.DataFrame:
+    """
+    逐年加载 + 负采样 + merge cache + 交叉特征, 最后 concat。
+    负采样后每年行数从 ~9500万 降到 ~2000万, 17年总计 ~3.4亿行, 内存 ~80GB。
+    """
+    print(f"Loading data for years: {years} | Sample Ratio: {sample_ratio*100:.0f}%")
+    if neg_sample:
+        print(f"  Neg sampling: {N_HARD_NEG} hard + {N_RAND_NEG} random per query")
+
+    all_dfs = []
+    total_rows = 0
+
     for year in years:
-        file_path = PROCESSED_DIR / f'processed_{year}.feather'
-        if not file_path.exists():
-            print(f"  [Warning] Year {year} file not found: {file_path}")
-            continue
-        qid_series = pd.read_feather(file_path, columns=['qid'])['qid']
-        if 0.0 < sample_ratio < 1.0:
-            unique_qids = pd.Series(qid_series.unique())
-            sampled_qids = set(unique_qids.sample(frac=sample_ratio, random_state=random_seed))
-            n_rows = int((qid_series.isin(sampled_qids)).sum())
-            print(f"  - {year}: {n_rows:,} rows (sampled {len(sampled_qids):,} / {len(unique_qids):,} queries)")
-        else:
-            n_rows = len(qid_series)
-            print(f"  - {year}: {n_rows:,} rows (all queries)")
-        year_row_counts.append(n_rows)
-        year_files.append((year, file_path))
-        del qid_series
-        gc.collect()
-
-    total_rows = sum(year_row_counts)
-    if total_rows == 0:
-        raise ValueError(f"No valid data loaded for years {years}!")
-    print(f"Total rows to load: {total_rows:,}")
-
-    # ── Pass 2: 预分配 numpy 数组，逐年填充 ──
-    print("Pass 2: Pre-allocating memory and filling...")
-    # 确定每列的 dtype
-    col_dtypes = {}
-    for c in keep_cols:
-        if c in CATS:
-            col_dtypes[c] = np.int8
-        elif c == 'Label':
-            col_dtypes[c] = np.int8
-        elif c == 'Rank':
-            col_dtypes[c] = np.int16
-        elif c == 'qid':
-            col_dtypes[c] = np.int64
-        else:
-            col_dtypes[c] = np.float32
-
-    # 预分配
-    arrays = {col: np.empty(total_rows, dtype=col_dtypes[col]) for col in keep_cols}
-    est_gb = sum(a.nbytes for a in arrays.values()) / 1024**3
-    print(f"  Pre-allocated {est_gb:.2f} GB for {len(keep_cols)} columns x {total_rows:,} rows")
-
-    # 逐年读取并填充
-    offset = 0
-    for (year, file_path), n_rows in zip(year_files, year_row_counts):
         t0 = time.time()
-        df = pd.read_feather(file_path, columns=keep_cols)
 
-        # 采样
-        if 0.0 < sample_ratio < 1.0:
-            unique_qids = pd.Series(df['qid'].unique())
-            sampled_qids = set(unique_qids.sample(frac=sample_ratio, random_state=random_seed))
-            mask = df['qid'].isin(sampled_qids)
-            df = df.loc[mask]
+        df = _process_single_year(year, sample_ratio, random_seed, neg_sample=neg_sample)
+        if df is None:
+            print(f"  [Warning] {year} not found, skip")
+            continue
 
-        # 逐列填充到预分配数组
-        end = offset + len(df)
-        for col in keep_cols:
-            arrays[col][offset:end] = df[col].to_numpy(dtype=col_dtypes[col], copy=False)
+        n_q = df['qid'].nunique()
+        total_rows += len(df)
+        print(f"  {year}: {len(df):,} rows, {n_q:,} queries ({time.time()-t0:.1f}s)")
+        all_dfs.append(df)
 
-        offset = end
-        del df
-        gc.collect()
-        print(f"  - {year}: filled [{offset - n_rows:,} : {offset:,}] in {time.time()-t0:.1f}s")
+    if not all_dfs:
+        raise ValueError(f"No data loaded for years {years}!")
 
-    # 截断（理论上 offset == total_rows，但防御性处理）
-    if offset < total_rows:
-        arrays = {col: arr[:offset] for col, arr in arrays.items()}
-
-    # ── 一次性构建 DataFrame（零拷贝，numpy 数组直接作为底层 buffer）──
-    print("Building final DataFrame from pre-allocated arrays...")
-    final_df = pd.DataFrame(arrays)
-    del arrays
+    print(f"Concatenating {len(all_dfs)} years, total {total_rows:,} rows...")
+    final = pd.concat(all_dfs, ignore_index=True)
+    del all_dfs
     gc.collect()
 
-    # 转 category（此时只有一张表，int8 -> category 极快）
-    print("Converting categoricals...")
+    # 转 category
     for col in CATS:
-        if col in final_df.columns:
-            final_df[col] = final_df[col].astype('category')
+        if col in final.columns:
+            final[col] = final[col].astype('category')
 
-    print(f"Data loaded: {final_df.shape}, Memory: {final_df.memory_usage(deep=True).sum()/1024**3:.2f} GB")
-    return final_df
+    print(f"Data loaded: {final.shape}, Memory: {final.memory_usage(deep=True).sum()/1024**3:.2f} GB")
+    return final
+
 
 def calculate_sample_weights(df: pd.DataFrame) -> np.ndarray:
-    """
-    计算样本权重：正负比 1:23.7，需要大幅提升正样本权重来对抗不平衡。
-    基准思路：负样本=1，正样本基础权重≈正负比(~24)，头部Rank额外加码。
-    这样在 loss 中正样本的总贡献与负样本大致持平，再由 Rank 梯度引导排序。
-    """
+    """正负比 ~1:23, 正样本按 Rank 分级加权"""
     weights = np.ones(len(df), dtype=np.float32)
     pos_mask = df['Label'] == 1
     rank = df['Rank']
-
-    # 正样本按 Rank 分级加权，基础对齐正负比后再按重要性递增
-    weights[pos_mask & (rank <= 3)]  = 50.0   # 最重要的头部城市
+    weights[pos_mask & (rank <= 3)]  = 50.0
     weights[pos_mask & (rank > 3)  & (rank <= 10)] = 35.0
-    weights[pos_mask & (rank > 10) & (rank <= 20)] = 24.0   # 基础对齐正负比
+    weights[pos_mask & (rank > 10) & (rank <= 20)] = 24.0
     return weights
 
+
 class CheckpointCallback:
-    """自定义 LightGBM 回调函数：用于定期保存 Checkpoint 模型文件"""
+    """定期保存 Checkpoint"""
     def __init__(self, output_dir, freq=10):
         self.output_dir = Path(output_dir) / "checkpoints"
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.freq = freq
-        # LightGBM 机制要求的属性，确保在日志之后执行，且是在迭代完成后触发
-        self.order = 30  
+        self.order = 30
         self.before_iteration = False
 
     def __call__(self, env):
-        # env.iteration 是从 0 开始的
         current_round = env.iteration + 1
         if current_round % self.freq == 0:
             ckpt_path = self.output_dir / f"model_iter_{current_round}.txt"
             env.model.save_model(str(ckpt_path))
-            print(f" 💾 [Checkpoint] Model saved at iteration {current_round} -> {ckpt_path}")
+            print(f"  [Checkpoint] iter {current_round} -> {ckpt_path}")
+
 
 def main():
     TRAIN_YEARS = list(range(2000, 2017))
     VAL_YEARS   = [2017, 2018]
-    TEST_YEARS  = [2019, 2020]
 
-    # 核心指标
-    SAMPLE_RATIO = 0.4
+    SAMPLE_RATIO = 0.8  # 可选采样比例 (0.0-1.0), 用于快速迭代
 
-    print("="*60)
-    print(f"🚀 LightGBM Fast & Memory-Optimized Training Session")
-    print("="*60)
+    print("=" * 60)
+    print("LightGBM Recall Training (v2 - Rich Features)")
+    print(f"Features: {len(FEATS)} total")
+    print("=" * 60)
 
     # 1. 加载数据
     df_train = load_data(TRAIN_YEARS, sample_ratio=SAMPLE_RATIO, random_seed=42)
     df_val   = load_data(VAL_YEARS, sample_ratio=SAMPLE_RATIO, random_seed=42)
 
-    # 2. 计算权重
+    # 2. 权重
     print("\nCalculating sample weights...")
     train_weights = calculate_sample_weights(df_train)
 
-    # 🌟 修复点：将 params 提前定义！
-    # 因为 max_bin 是构建 Dataset 直方图时的底层参数，必须在 construct() 之前让 Dataset 知道。
+    # 3. 参数
     params = {
         'objective': 'binary',
         'metric': ['binary_logloss', 'auc'],
-        'boosting_type': 'gbdt',
-        'learning_rate': 0.05,        # 降低学习率，配合更多轮次学得更细
-        'num_leaves': 127,            # 加大叶子数，增强表达能力
-        'max_depth': 10,              # 适度加深
-        'n_estimators': 5000,         # 增加轮次，2-3小时可接受
-
-        # 🚀 性能与速度优化
-        'n_jobs': 36,
-        'num_threads': 36,
-        'max_bin': 127,               # 配合更多叶子，提升分箱精度
+        'boosting_type': 'gbdt', 
+        'learning_rate': 0.1,   # 或者0.05
+        'num_leaves': 255,  # 或者127
+        'max_depth': 10,
+        'n_estimators': 5000,
+        'n_jobs': os.cpu_count(),
+        'num_threads': os.cpu_count(),
+        'max_bin': 255,
         'bagging_fraction': 0.8,
         'bagging_freq': 1,
-        'feature_fraction': 0.8,
-
-        # 正则化：防止更深的树过拟合
+        'feature_fraction': 0.7,
         'lambda_l1': 0.1,
         'lambda_l2': 1.0,
-        'min_child_samples': 100,     # 叶子最少样本数，防止过拟合
-
+        'min_child_samples': 100,
         'verbosity': -1,
     }
 
-    # 3. 构建 LGBM 数据集
+    # 4. 构建 Dataset
     print("Constructing LightGBM Datasets...")
     train_ds = lgb.Dataset(
-        df_train[FEATS],
-        label=df_train['Label'],
-        weight=train_weights,
-        categorical_feature=CATS,
-        params=params,          # 🌟 修复点：传入 params，告诉底层按照 max_bin=63 进行数据分箱
-        free_raw_data=True      # 🚀 内存优化 2：允许 LGBM 在构建后丢弃原始数据
+        df_train[FEATS], label=df_train['Label'], weight=train_weights,
+        categorical_feature=CATS, params=params, free_raw_data=True,
     )
-    
     val_ds = lgb.Dataset(
-        df_val[FEATS],
-        label=df_val['Label'],
-        categorical_feature=CATS,
-        reference=train_ds,
-        params=params,          # 🌟 修复点：验证集同样传入 params
-        free_raw_data=True
+        df_val[FEATS], label=df_val['Label'],
+        categorical_feature=CATS, reference=train_ds,
+        params=params, free_raw_data=True,
     )
 
-    # 🚀 内存优化 3：手动强制 LGBM 提前构建底层直方图数据
-    print("Forcing LightGBM Dataset construction and clearing Pandas memory...")
+    print("Forcing Dataset construction...")
     train_ds.construct()
     val_ds.construct()
-
-    # 构建完成后，Pandas 原数据彻底没用了，直接暴力删除并回收内存！
-    del df_train
-    del df_val
-    del train_weights
+    del df_train, df_val, train_weights
     gc.collect()
 
-    # 4. 训练模型
-    print("\nTraining started (Utilizing 36 Cores)...")
+    # 5. 训练
+    n_cores = os.cpu_count()
+    print(f"\nTraining started ({n_cores} cores)...")
     start_time = time.time()
-    
-    # 实例化自定义的 checkpoint 回调，每 10 轮保存一次
-    ckpt_callback = CheckpointCallback(output_dir=OUTPUT_DIR, freq=10)
 
+    ckpt_cb = CheckpointCallback(output_dir=OUTPUT_DIR, freq=20)
     model = lgb.train(
-        params,
-        train_ds,
-        valid_sets=[val_ds],          # 彻底移除 train_ds 评估，跳过无意义的大量数据打分和排序
-        valid_names=['val'],          # 同步修改评估集名称
+        params, train_ds,
+        valid_sets=[val_ds], valid_names=['val'],
         callbacks=[
-            lgb.early_stopping(stopping_rounds=100, verbose=True),
-            lgb.log_evaluation(10),  # 每 10 轮打印一次
-            ckpt_callback            # 加入 Checkpoint 回调
-        ]
+            lgb.early_stopping(stopping_rounds=50, verbose=True),
+            lgb.log_evaluation(10),
+            ckpt_cb,
+        ],
     )
     print(f"Training finished in {(time.time() - start_time)/60:.2f} minutes.")
 
-    # 5. 保存模型
+    # 6. 保存
     models_dir = OUTPUT_DIR / "models"
     models_dir.mkdir(parents=True, exist_ok=True)
-    model_path = models_dir / 'model_fast.txt'
+    model_path = models_dir / 'model_v2.txt'
     model.save_model(str(model_path))
-    print(f"Final Model saved to {model_path}")
+    print(f"Model saved to {model_path}")
 
-    # 6. 打印特征重要性
+    # 7. 特征重要性
     imp = pd.DataFrame({'feature': FEATS, 'importance': model.feature_importance('gain')})
-    print("\n🏆 Top Features by Gain:")
-    print(imp.sort_values('importance', ascending=False).to_string(index=False))
+    imp = imp.sort_values('importance', ascending=False)
+    print(f"\nTop 20 Features by Gain:")
+    print(imp.head(20).to_string(index=False))
+
 
 if __name__ == '__main__':
     main()

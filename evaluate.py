@@ -1,20 +1,19 @@
 """
-轻量版 Recall 评估脚本
-直接从 feather 文件读取已有特征 + LightGBM predict，多核并行推理。
+Recall@K 评估脚本 (v2 - 与 simple_train.py 特征完全对齐)
 
-召回率计算逻辑修正 (Recall@20)：
-  1. 对每个 query 统一推理 top20 城市（按 score 降序）
-  2. 根据 GT 中实际有去向城市集合 (Label=1 的城市)，
-     直接拿 pred 的前 20 个城市与 GT 集合比较命中率
-  3. 公式: Recall@20 = |Top 20 ∩ GT| / len(GT)
+架构与训练脚本一致:
+  base_ready/base_YYYY.feather + city_pair_cache/city_pairs_YYYY.parquet
+  动态 join + 交叉特征 → LightGBM predict → Recall@20
 
-真正关心的指标其实是 Recall@K（比如 Recall@20），而不是严格的 R-Precision（取与 GT 数量相等的头部预测去求交集）。下游的排序模型（Ranking）接收的是固定数量的候选集（比如 20 或 50），只要这 20 个坑位里包含了用户最终去的真实城市，召回阶段的任务就算圆满完成了。
-你之前的代码里，pred_top_n = set(group['To_City'].iloc[:n].values) 这种写法是对模型极大的“不公平”惩罚。平均 GT 有 14 个，意味着你只让模型输出 14 个结果去撞击这 14 个答案，这太难了。放宽到 Top 20
+运行: cd /data1/wxj/Recall_city_project/ && uv run evaluate.py
+      uv run evaluate.py --model output/models/model_v2.txt --years 2019 2020
+依赖: output/base_ready/, data/city_pair_cache/, 训练好的模型文件
 """
 
 from __future__ import annotations
 
 import argparse
+import gc
 import os
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -24,46 +23,57 @@ import lightgbm as lgb
 import numpy as np
 import pandas as pd
 
+# ── 从 simple_train.py 导入共享的特征定义, 保证对齐 ──
+from simple_train import (
+    FEATS, CATS, CACHE_FEAT_COLS, CROSS_FEATS,
+    load_cache_for_year, build_cross_features,
+    BASE_DIR, CACHE_DIR,
+)
 
-# ── 与 simple_train.py 完全对齐的特征列表 ──
-FEATS = [
-    'gender', 'age_group', 'education', 'industry', 'income', 'family',
-    'geo_distance', 'dialect_distance',
-    'gdp_per_capita_ratio', 'unemployment_rate_ratio', 'housing_price_avg_ratio',
-    'rent_avg_ratio', 'daily_cost_index_ratio', 'medical_score_ratio',
-    'education_score_ratio', 'transport_convenience_ratio', 'population_total_ratio',
-    'is_same_province',
-]
-
-CATS = ['gender', 'age_group', 'education', 'industry', 'income', 'family', 'is_same_province']
-
-PROCESSED_DIR = Path("output/processed_ready")
-
-# 核心修改 模型路径 每次更新
-DEFAULT_MODEL = Path("output/models/model_iter_3050.txt")
+DEFAULT_MODEL = Path("output/models/model_v2.txt")
 
 
 def load_year_data(year: int, sample_n: int | None = None, seed: int = 42) -> pd.DataFrame:
-    """从 feather 加载单年数据，可选采样 sample_n 个 query。"""
-    fp = PROCESSED_DIR / f"processed_{year}.feather"
-    if not fp.exists():
-        raise FileNotFoundError(f"Feather not found: {fp}")
+    """加载单年数据: base feather + cache join + 交叉特征"""
+    base_path = BASE_DIR / f"base_{year}.feather"
+    if not base_path.exists():
+        raise FileNotFoundError(f"Base feather not found: {base_path}")
 
-    cols_needed = FEATS + ['qid', 'To_City', 'Label', 'Rank']
-    df = pd.read_feather(fp, columns=cols_needed)
+    base = pd.read_feather(base_path)
 
+    # 采样
     if sample_n is not None and sample_n > 0:
-        unique_qids = df['qid'].unique()
+        unique_qids = base['qid'].unique()
         if len(unique_qids) > sample_n:
             rng = np.random.default_rng(seed)
-            sampled_qids = rng.choice(unique_qids, size=sample_n, replace=False)
-            df = df[df['qid'].isin(set(sampled_qids))]
+            sampled = rng.choice(unique_qids, size=sample_n, replace=False)
+            base = base[base['qid'].isin(set(sampled))].copy()
 
-    return df
+    # join cache
+    cache = load_cache_for_year(year)
+    base = base.merge(
+        cache,
+        left_on=['From_City', 'To_City'],
+        right_on=['from_city', 'to_city'],
+        how='left',
+    )
+    base.drop(columns=['from_city', 'to_city'], inplace=True)
+    del cache
+    gc.collect()
+
+    # 交叉特征
+    base = build_cross_features(base)
+
+    # 填充缺失
+    for col in CACHE_FEAT_COLS + CROSS_FEATS:
+        if col in base.columns:
+            base[col] = base[col].fillna(0).astype(np.float32)
+
+    return base
 
 
 def predict_chunk(model_path: str, chunk_df: pd.DataFrame) -> pd.DataFrame:
-    """在子进程中加载模型并对一个 chunk 进行 predict，返回 (qid, To_City, score)。"""
+    """子进程: 加载模型 + predict, 返回 (qid, To_City, score)"""
     model = lgb.Booster(model_file=model_path)
     X = chunk_df[FEATS].copy()
     for c in CATS:
@@ -78,8 +88,7 @@ def predict_chunk(model_path: str, chunk_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def parallel_predict(model_path: str, df: pd.DataFrame, n_workers: int) -> pd.DataFrame:
-    """多进程并行推理，按 qid 分 chunk 分发到各 worker。"""
-    # 按 qid 分组，均匀分配到 n_workers 个 chunk
+    """多进程并行推理"""
     unique_qids = df['qid'].unique()
     qid_splits = np.array_split(unique_qids, n_workers)
 
@@ -104,16 +113,11 @@ def parallel_predict(model_path: str, df: pd.DataFrame, n_workers: int) -> pd.Da
 
 def compute_recall(df: pd.DataFrame, pred_df: pd.DataFrame, top_infer: int = 20) -> pd.DataFrame:
     """
-    计算自适应召回率 (Recall@K)。
-    对每个 query:
-      - GT 集合 = Label==1 的 To_City 集合，大小为 n
-      - Pred 集合 = score 降序排列的前 top_infer (默认20) 个 To_City
-      - recall = |Pred ∩ GT| / n
+    Recall@K: 对每个 query 取 score top_infer 个预测, 与 GT 求交集。
+    recall = |Top K ∩ GT| / |GT|
     """
-    # 构建 GT: 每个 qid 的正样本城市集合
     gt = df[df['Label'] == 1].groupby('qid')['To_City'].apply(set).to_dict()
 
-    # 构建 Pred: 直接截断取 Top K
     pred_df = pred_df.sort_values(['qid', 'score'], ascending=[True, False])
     pred_ranked = pred_df.groupby('qid').head(top_infer)
 
@@ -123,24 +127,16 @@ def compute_recall(df: pd.DataFrame, pred_df: pd.DataFrame, top_infer: int = 20)
         n = len(gt_set)
         if n == 0:
             continue
-        
-        # 【修改点】：直接用 Top K 集合去命中 GT，不再强行按 n 截断
         pred_top_k = set(group['To_City'].values)
         hits = len(pred_top_k & gt_set)
-        
-        rows.append({
-            'qid': qid,
-            'gt_size': n,
-            'hits': hits,
-            'recall': hits / n,
-        })
+        rows.append({'qid': qid, 'gt_size': n, 'hits': hits, 'recall': hits / n})
 
     return pd.DataFrame(rows)
 
 
 def evaluate_year(model_path: str, year: int, sample_n: int | None,
                   n_workers: int, seed: int = 42) -> dict:
-    """评估单年，返回统计结果字典。"""
+    """评估单年"""
     t0 = time.time()
     print(f"\n{'='*60}")
     print(f"[Year {year}] Loading data...")
@@ -166,23 +162,20 @@ def evaluate_year(model_path: str, year: int, sample_n: int | None,
     print(f"  Avg Recall@20:     {avg_recall:.4f} ({avg_recall*100:.2f}%)")
 
     return {
-        'year': year,
-        'n_queries': len(recall_df),
-        'avg_gt_size': avg_gt_size,
-        'avg_hits': avg_hits,
-        'recall': avg_recall,
-        'elapsed_s': elapsed,
+        'year': year, 'n_queries': len(recall_df),
+        'avg_gt_size': avg_gt_size, 'avg_hits': avg_hits,
+        'recall': avg_recall, 'elapsed_s': elapsed,
     }
 
 
 def main():
-    parser = argparse.ArgumentParser(description="轻量版 Recall 评估")
+    parser = argparse.ArgumentParser(description="Recall@K Evaluation (v2)")
     parser.add_argument("--model", type=str, default=str(DEFAULT_MODEL))
     parser.add_argument("--years", nargs="+", type=int, default=[2019, 2020])
     parser.add_argument("--sample-n", type=int, default=10000,
-                        help="每年采样 query 数，0 表示全量")
+                        help="每年采样 query 数, 0=全量")
     parser.add_argument("--workers", type=int, default=0,
-                        help="并行 worker 数，0=自动(CPU核心数)")
+                        help="并行 worker 数, 0=auto")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -193,10 +186,11 @@ def main():
     n_workers = args.workers if args.workers > 0 else os.cpu_count()
     sample_n = args.sample_n if args.sample_n > 0 else None
 
-    print(f"Model:   {model_path}")
-    print(f"Years:   {args.years}")
-    print(f"Sample:  {sample_n or 'ALL'} queries/year")
-    print(f"Workers: {n_workers}")
+    print(f"Model:    {model_path}")
+    print(f"Years:    {args.years}")
+    print(f"Sample:   {sample_n or 'ALL'} queries/year")
+    print(f"Workers:  {n_workers}")
+    print(f"Features: {len(FEATS)}")
 
     results = []
     for year in args.years:
