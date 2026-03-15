@@ -1,12 +1,12 @@
 """
-Recall@K 评估脚本 (v2 - 与 simple_train.py 特征完全对齐)
+Recall@K 评估脚本 (v3 - 一次推理计算多个 K 值)
 
 架构与训练脚本一致:
   base_ready/base_YYYY.feather + city_pair_cache/city_pairs_YYYY.parquet
-  动态 join + 交叉特征 → LightGBM predict → Recall@20
+  动态 join + 交叉特征 → LightGBM predict → Recall@5/10/20/30
 
 运行: cd /data1/wxj/Recall_city_project/ && uv run evaluate.py
-      uv run evaluate.py --model output/models/model_v2.txt --years 2019 2020
+      uv run evaluate.py --model output/models/model_0315.txt --years 2019 2020
 依赖: output/base_ready/, data/city_pair_cache/, 训练好的模型文件
 """
 
@@ -30,7 +30,7 @@ from simple_train import (
     BASE_DIR, CACHE_DIR,
 )
 
-DEFAULT_MODEL = Path("output\models\model_0315.txt")
+DEFAULT_MODEL = Path("output/models/model_0315.txt")
 
 
 def load_year_data(year: int, sample_n: int | None = None, seed: int = 42) -> pd.DataFrame:
@@ -111,15 +111,17 @@ def parallel_predict(model_path: str, df: pd.DataFrame, n_workers: int) -> pd.Da
     return pd.concat(results, ignore_index=True)
 
 
-def compute_recall(df: pd.DataFrame, pred_df: pd.DataFrame, top_infer: int = 20) -> pd.DataFrame:
+def compute_recall_multi_k(df: pd.DataFrame, pred_df: pd.DataFrame, k_list: list[int] = [5, 10, 20, 30]) -> pd.DataFrame:
     """
-    Recall@K: 对每个 query 取 score top_infer 个预测, 与 GT 求交集。
-    recall = |Top K ∩ GT| / |GT|
+    一次推理，计算多个 K 值的 Recall@K。
+    返回每个 query 的 (qid, gt_size, hits@5, recall@5, hits@10, recall@10, hits@20, recall@20, hits@30, recall@30)
     """
     gt = df[df['Label'] == 1].groupby('qid')['To_City'].apply(set).to_dict()
 
+    # 按 score 降序排序，取最大 K（这里是 30）
+    max_k = max(k_list)
     pred_df = pred_df.sort_values(['qid', 'score'], ascending=[True, False])
-    pred_ranked = pred_df.groupby('qid').head(top_infer)
+    pred_ranked = pred_df.groupby('qid').head(max_k)
 
     rows = []
     for qid, group in pred_ranked.groupby('qid'):
@@ -127,16 +129,27 @@ def compute_recall(df: pd.DataFrame, pred_df: pd.DataFrame, top_infer: int = 20)
         n = len(gt_set)
         if n == 0:
             continue
-        pred_top_k = set(group['To_City'].values)
-        hits = len(pred_top_k & gt_set)
-        rows.append({'qid': qid, 'gt_size': n, 'hits': hits, 'recall': hits / n})
+
+        # 取 top-K 预测城市列表（已按 score 降序）
+        pred_cities = group['To_City'].values
+
+        row = {'qid': qid, 'gt_size': n}
+
+        # 对每个 K 值计算 hits 和 recall
+        for k in k_list:
+            pred_top_k = set(pred_cities[:k])
+            hits = len(pred_top_k & gt_set)
+            row[f'hits@{k}'] = hits
+            row[f'recall@{k}'] = hits / n
+
+        rows.append(row)
 
     return pd.DataFrame(rows)
 
 
 def evaluate_year(model_path: str, year: int, sample_n: int | None,
                   n_workers: int, seed: int = 42) -> dict:
-    """评估单年"""
+    """评估单年，一次推理计算 Recall@5、@10、@20、@30"""
     t0 = time.time()
     print(f"\n{'='*60}")
     print(f"[Year {year}] Loading data...")
@@ -147,24 +160,36 @@ def evaluate_year(model_path: str, year: int, sample_n: int | None,
     print(f"[Year {year}] Predicting with {n_workers} workers...")
     pred_df = parallel_predict(model_path, df, n_workers)
 
-    print(f"[Year {year}] Computing Recall@20...")
-    recall_df = compute_recall(df, pred_df, top_infer=20)
+    print(f"[Year {year}] Computing Recall@5, @10, @20, @30...")
+    recall_df = compute_recall_multi_k(df, pred_df, k_list=[5, 10, 20, 30])
 
-    avg_recall = recall_df['recall'].mean()
     avg_gt_size = recall_df['gt_size'].mean()
-    avg_hits = recall_df['hits'].mean()
+    avg_recall_5 = recall_df['recall@5'].mean()
+    avg_recall_10 = recall_df['recall@10'].mean()
+    avg_recall_20 = recall_df['recall@20'].mean()
+    avg_recall_30 = recall_df['recall@30'].mean()
+    avg_hits_5 = recall_df['hits@5'].mean()
+    avg_hits_10 = recall_df['hits@10'].mean()
+    avg_hits_20 = recall_df['hits@20'].mean()
+    avg_hits_30 = recall_df['hits@30'].mean()
     elapsed = time.time() - t0
 
     print(f"[Year {year}] Done in {elapsed:.1f}s")
     print(f"  Queries evaluated: {len(recall_df)}")
     print(f"  Avg GT cities:     {avg_gt_size:.2f}")
-    print(f"  Avg hits:          {avg_hits:.2f}")
-    print(f"  Avg Recall@20:     {avg_recall:.4f} ({avg_recall*100:.2f}%)")
+    print(f"  Recall@5:  {avg_recall_5:.4f} ({avg_recall_5*100:.2f}%) | Avg hits: {avg_hits_5:.2f}")
+    print(f"  Recall@10: {avg_recall_10:.4f} ({avg_recall_10*100:.2f}%) | Avg hits: {avg_hits_10:.2f}")
+    print(f"  Recall@20: {avg_recall_20:.4f} ({avg_recall_20*100:.2f}%) | Avg hits: {avg_hits_20:.2f}")
+    print(f"  Recall@30: {avg_recall_30:.4f} ({avg_recall_30*100:.2f}%) | Avg hits: {avg_hits_30:.2f}")
 
     return {
         'year': year, 'n_queries': len(recall_df),
-        'avg_gt_size': avg_gt_size, 'avg_hits': avg_hits,
-        'recall': avg_recall, 'elapsed_s': elapsed,
+        'avg_gt_size': avg_gt_size,
+        'recall@5': avg_recall_5, 'hits@5': avg_hits_5,
+        'recall@10': avg_recall_10, 'hits@10': avg_hits_10,
+        'recall@20': avg_recall_20, 'hits@20': avg_hits_20,
+        'recall@30': avg_recall_30, 'hits@30': avg_hits_30,
+        'elapsed_s': elapsed,
     }
 
 
@@ -198,23 +223,32 @@ def main():
         results.append(r)
 
     # 汇总
-    print(f"\n{'='*60}")
+    print(f"\n{'='*90}")
     print("Summary:")
-    print(f"{'Year':<8} {'Queries':<10} {'AvgGT':<8} {'AvgHits':<10} {'Recall@20':<12} {'Time':<8}")
-    print("-" * 60)
+    print(f"{'Year':<8} {'Queries':<10} {'AvgGT':<8} {'R@5':<10} {'R@10':<10} {'R@20':<10} {'R@30':<10} {'Time':<8}")
+    print("-" * 90)
     total_queries = 0
-    weighted_recall_sum = 0.0
+    weighted_r5 = 0.0
+    weighted_r10 = 0.0
+    weighted_r20 = 0.0
+    weighted_r30 = 0.0
     for r in results:
         print(f"{r['year']:<8} {r['n_queries']:<10} {r['avg_gt_size']:<8.2f} "
-              f"{r['avg_hits']:<10.2f} {r['recall']:<12.4f} {r['elapsed_s']:<8.1f}s")
+              f"{r['recall@5']:<10.4f} {r['recall@10']:<10.4f} {r['recall@20']:<10.4f} {r['recall@30']:<10.4f} {r['elapsed_s']:<8.1f}s")
         total_queries += r['n_queries']
-        weighted_recall_sum += r['recall'] * r['n_queries']
+        weighted_r5 += r['recall@5'] * r['n_queries']
+        weighted_r10 += r['recall@10'] * r['n_queries']
+        weighted_r20 += r['recall@20'] * r['n_queries']
+        weighted_r30 += r['recall@30'] * r['n_queries']
 
     if total_queries > 0:
-        overall = weighted_recall_sum / total_queries
-        print("-" * 60)
-        print(f"{'ALL':<8} {total_queries:<10} {'':8} {'':10} {overall:<12.4f}")
-    print("=" * 60)
+        overall_r5 = weighted_r5 / total_queries
+        overall_r10 = weighted_r10 / total_queries
+        overall_r20 = weighted_r20 / total_queries
+        overall_r30 = weighted_r30 / total_queries
+        print("-" * 90)
+        print(f"{'ALL':<8} {total_queries:<10} {'':8} {overall_r5:<10.4f} {overall_r10:<10.4f} {overall_r20:<10.4f} {overall_r30:<10.4f}")
+    print("=" * 90)
 
 
 if __name__ == "__main__":
