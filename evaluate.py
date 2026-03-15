@@ -30,7 +30,7 @@ from simple_train import (
     BASE_DIR, CACHE_DIR,
 )
 
-DEFAULT_MODEL = Path("output/models/model_v2.txt")
+DEFAULT_MODEL = Path("output\models\model_0315.txt")
 
 
 def load_year_data(year: int, sample_n: int | None = None, seed: int = 42) -> pd.DataFrame:
