@@ -15,6 +15,7 @@ import pandas as pd
 from pathlib import Path
 import time
 import sys
+from tqdm import tqdm
 
 DATA_DIR = Path("data")
 CITY_INFO_DIR = DATA_DIR / "cities_2000-2020"
@@ -207,7 +208,7 @@ def build_city_pairs_for_year(year: int, city_df: pd.DataFrame, edges_df: pd.Dat
     to_city_arr = pairs["to_city"].values
 
     migrant_vals = np.zeros(len(pairs), dtype=np.float32)
-    for i in range(len(pairs)):
+    for i in tqdm(range(len(pairs)), desc=f"  [{year}] 老乡网络", leave=False):
         to_cid = int(to_city_arr[i])
         from_prov = from_provinces[i]
         stock = migrant_stocks.get(to_cid, {})
@@ -253,7 +254,7 @@ def main():
     edges_df = load_edges()
     print(f"  Loaded {len(edges_df):,} edges")
 
-    for year in years:
+    for year in tqdm(years, desc="生成 cache"):
         t0 = time.time()
         print(f"\n{'='*50}")
         print(f"Processing year {year}...")
