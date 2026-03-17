@@ -1,6 +1,7 @@
 import os
 import gc
 import time
+import shutil
 import psutil
 import lightgbm as lgb
 import numpy as np
@@ -11,8 +12,12 @@ from tqdm import tqdm
 # ================= 极速存储路径 =================
 BASE_DIR = Path("output/base_ready")
 CACHE_DIR = Path("data/city_pair_cache")
-# 🎯 将二进制文件指向你的高速且宽裕的 /data2 盘
 BIN_OUTPUT_DIR = Path("/data2/wxj/recall_bin") 
+
+# 🎯 方案 B：彻底清空旧的二进制缓存，保证数据绝对干净
+if BIN_OUTPUT_DIR.exists():
+    print(f"🧹 正在彻底清空旧缓存目录: {BIN_OUTPUT_DIR} ...")
+    shutil.rmtree(BIN_OUTPUT_DIR)
 BIN_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # ================= 特征定义 =================
@@ -28,7 +33,7 @@ CACHE_FEAT_COLS = RATIO_FEATS + DIFF_FEATS + ABS_FEATS + NET_DIST_FEATS
 
 HARD_NEG_CITIES_SET = {1100, 3100, 4401, 4403, 1200, 3201, 3205, 3301, 3302, 3401, 3702, 4101, 4201, 4301, 4406, 4419, 5000, 5101, 6101, 1301, 1401, 2101, 2102, 2201, 2301, 3202, 3203, 3204, 3206, 3303, 3304, 3306, 3307, 3310, 3501, 3502, 3505, 3601, 3701, 3706, 3707, 3713, 4404, 4413, 4420, 4501, 4601, 5201, 5301, 6501}
 
-# 🚀 核心内存优化：随机负样本降低至 50，树模型完全足够，直接省下 50GB 内存！
+# 🚀 核心内存优化：随机负样本降低至 50，省下 50GB 内存！
 N_RAND_NEG = 50
 
 def _get_mem_gb():
@@ -71,12 +76,11 @@ def _process_single_year(year: int, sample_ratio: float, random_seed: int, is_tr
     # =====================================================================
     # 🎯 算法核心大招：Top 1-10 全阶梯指数落差与权重倾斜
     # =====================================================================
-    # 用int16规避溢出，Relevance控制在2^7-1=127以内（LightGBM计算更稳定）
     relevance = np.zeros_like(rank, dtype=np.int16) 
     weight = np.ones_like(rank, dtype=np.float32)
 
     # Top 1-5：核心优先级（Relevance=2^n-1，权重梯度递减）
-    relevance[rank == 1] = 127; weight[rank == 1] = 15.0  # Top1 核心中的核心
+    relevance[rank == 1] = 127; weight[rank == 1] = 15.0  
     relevance[rank == 2] = 63;  weight[rank == 2] = 14.0
     relevance[rank == 3] = 31;  weight[rank == 3] = 13.0
     relevance[rank == 4] = 15;  weight[rank == 4] = 12.0
@@ -176,10 +180,11 @@ def _process_single_year(year: int, sample_ratio: float, random_seed: int, is_tr
 
     return base, group_counts, weights_final
 
-def build_and_save_bin(years, split_name, max_rows, sample_ratio, is_train):
+# 🎯 核心改动点：增加 reference_ds 参数，解决 Validation 报错
+def build_and_save_bin(years, split_name, max_rows, sample_ratio, is_train, reference_ds=None):
     print(f"\n[{split_name}] 分配极速内存矩阵 (Max {max_rows:,} rows)... 当前 RSS: {_get_mem_gb():.1f} GB")
     X = np.empty((max_rows, len(FEATS)), dtype=np.float32)
-    y = np.empty(max_rows, dtype=np.int8)
+    y = np.empty(max_rows, dtype=np.int16) # 对齐 int16
     w = np.empty(max_rows, dtype=np.float32)
     all_groups = []
     current_idx = 0
@@ -206,31 +211,41 @@ def build_and_save_bin(years, split_name, max_rows, sample_ratio, is_train):
 
         current_idx += rows
         
-        # 强制释放 Pandas 残留
         del df, df_feats, weights; gc.collect()
         tqdm.write(f"  {year} | Rows: {rows:,} | Total: {current_idx:,} | RSS: {_get_mem_gb():.1f} GB | Time: {time.time()-t0:.1f}s")
 
-    # 截断空白部分
     X, y, w = X[:current_idx], y[:current_idx], w[:current_idx]
     all_groups = np.array(all_groups, dtype=np.int32)
 
     print(f"\n📦 数据处理完毕！耗时 {(time.time()-t_start)/60:.1f} 分钟。")
     print(f"正在构建 LightGBM 底层二进制文件（该过程会压缩数据并计算特征直方图，请耐心等待）...")
     
-    ds = lgb.Dataset(X, label=y, weight=w, group=all_groups, feature_name=list(FEATS), categorical_feature=CATS, free_raw_data=True)
+    # 🎯 核心改动点：强行传入 params={'max_bin': 255} 和 reference_ds 保证对齐
+    ds = lgb.Dataset(
+        X, label=y, weight=w, group=all_groups, 
+        feature_name=list(FEATS), categorical_feature=CATS, 
+        free_raw_data=True,
+        reference=reference_ds,       # 对齐验证集的桶边界
+        params={'max_bin': 255}       # 对齐训练脚本的 max_bin
+    )
+    
     bin_path = BIN_OUTPUT_DIR / f"{split_name.lower()}_v10_top10.bin"
     ds.construct()
     ds.save_binary(str(bin_path))
     
     print(f"✅ {split_name} 二进制文件已安全落地至高速盘: {bin_path}")
     
-    # 彻底清空内存，为验证集腾出空间
-    del X, y, w, all_groups, ds; gc.collect()
+    # 🎯 核心改动点：把构建好的 Dataset 对象返回，作为验证集的 reference
+    return ds
 
 if __name__ == '__main__':
-    # 🚀 降低了 N_RAND_NEG 后，4亿行绝对足够容纳训练集（省出几十G物理内存）
     TRAIN_MAX_ROWS = 400_000_000
     VAL_MAX_ROWS   = 50_000_000
 
-    build_and_save_bin(list(range(2000, 2017)), "Train", TRAIN_MAX_ROWS, 0.6, True)
-    build_and_save_bin([2017, 2018], "Val", VAL_MAX_ROWS, 0.2, False)
+    # 先构建 Train，并获取其 Dataset 对象
+    train_dataset = build_and_save_bin(list(range(2000, 2017)), "Train", TRAIN_MAX_ROWS, 0.6, True, reference_ds=None)
+    
+    # 将 Train 的 Dataset 对象作为 reference 传给 Val 构建过程
+    build_and_save_bin([2017, 2018], "Val", VAL_MAX_ROWS, 0.2, False, reference_ds=train_dataset)
+    
+    print("\n🎉 全部打包完成！现在可以直接去跑 rank_train.py ")
