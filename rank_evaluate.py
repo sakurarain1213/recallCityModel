@@ -12,7 +12,12 @@ Rank@K 排序评估脚本 (v1 - 针对 LambdaRank 模型的排序质量评估)
   动态 join + 交叉特征 → LightGBM predict → 排序指标
 
 运行: python rank_evaluate.py
-      python rank_evaluate.py --model output/models/model_rank.txt --years 2019 2020
+    单模型评估：
+python rank_evaluate.py --model output/models/model_v10_lambdarank_top10.txt --years 2019 2020
+    双模型对比：
+python rank_evaluate.py --model output/models/model_v10_lambdarank_top10.txt --model2 output/models/model_rank.txt --years 2019 2020
+
+
 """
 
 from __future__ import annotations
@@ -28,14 +33,14 @@ import lightgbm as lgb
 import numpy as np
 import pandas as pd
 
-# ── 从 rank_train.py 导入共享的特征定义, 保证与排序模型对齐 ──
-from rank_train import (
+# ── 从 build_bin_before_rank_train.py 导入共享的特征定义, 保证与排序模型对齐 ──
+from build_bin_before_rank_train import (
     FEATS, CATS, CACHE_FEAT_COLS, CROSS_FEATS,
     load_cache_for_year, build_cross_features,
     BASE_DIR, CACHE_DIR,
 )
 
-DEFAULT_MODEL = Path("output/models/model_rank.txt")
+DEFAULT_MODEL = Path("output\models\model_v10_lambdarank_top10.txt")
 K_LIST = [5, 10, 15, 20]
 
 
@@ -112,30 +117,30 @@ def parallel_predict(model_path: str, df: pd.DataFrame, n_workers: int) -> pd.Da
 
 # ================= 排序指标计算 =================
 
-def _dcg_at_k(relevance: np.ndarray, k: int) -> float:
-    """计算 DCG@K: sum( (2^rel - 1) / log2(pos + 1) )"""
-    rel = relevance[:k]
-    positions = np.arange(1, len(rel) + 1)
-    return float(np.sum((2.0 ** rel - 1.0) / np.log2(positions + 1.0)))
+def _dcg_at_k(gains: np.ndarray, k: int) -> float:
+    """计算 DCG@K: 直接使用绝对增益进行对数衰减"""
+    g = gains[:k]
+    positions = np.arange(1, len(g) + 1)
+    return float(np.sum(g / np.log2(positions + 1.0)))
 
 
-def _ndcg_at_k(relevance: np.ndarray, ideal_relevance: np.ndarray, k: int) -> float:
+def _ndcg_at_k(gains: np.ndarray, ideal_gains: np.ndarray, k: int) -> float:
     """计算 NDCG@K = DCG@K / IDCG@K"""
-    dcg = _dcg_at_k(relevance, k)
-    idcg = _dcg_at_k(ideal_relevance, k)
+    dcg = _dcg_at_k(gains, k)
+    idcg = _dcg_at_k(ideal_gains, k)
     if idcg == 0:
         return 0.0
     return dcg / idcg
 
 
-def _ap_at_k(hits: np.ndarray, k: int) -> float:
-    """计算 AP@K (Average Precision at K)"""
+def _ap_at_k(hits: np.ndarray, k: int, n_gt: int) -> float:
+    """计算 AP@K (Average Precision at K)，分母为 min(k, n_gt)"""
     hits_k = hits[:k]
     if hits_k.sum() == 0:
         return 0.0
     positions = np.arange(1, len(hits_k) + 1)
     precisions = np.cumsum(hits_k) / positions
-    return float(np.sum(precisions * hits_k) / hits_k.sum())
+    return float(np.sum(precisions * hits_k) / min(k, n_gt))
 
 
 def compute_rank_metrics(df: pd.DataFrame, pred_df: pd.DataFrame, k_list: list[int]) -> pd.DataFrame:
@@ -143,10 +148,13 @@ def compute_rank_metrics(df: pd.DataFrame, pred_df: pd.DataFrame, k_list: list[i
     核心：一次推理，计算所有排序指标。
 
     对每个 query:
-      1. 用 GT 的 Rank 构建 relevance (21 - Rank)，与训练标签一致
+      1. 用 GT 的 Rank 构建绝对增益（与基线对齐：2^(21-Rank) - 1）
       2. 按模型 score 降序排列候选城市
       3. 计算 NDCG@K, MAP@K, Precision@K, MRR
     """
+    # 🎯 与基线完全对齐的绝对增益映射：2^(21-Rank) - 1
+    RANK_TO_GAIN = {rank: (2.0 ** (21 - rank) - 1.0) for rank in range(1, 21)}
+
     # 构建 GT: qid -> {To_City: Rank}
     gt_rows = df[(df['Rank'] > 0) & (df['Rank'] <= 20)]
     gt_dict = gt_rows.groupby('qid').apply(
@@ -166,12 +174,12 @@ def compute_rank_metrics(df: pd.DataFrame, pred_df: pd.DataFrame, k_list: list[i
 
         pred_cities = group['To_City'].values
 
-        # 模型预测顺序下的 relevance 序列
-        pred_relevance = np.array([21 - gt_ranks[c] if c in gt_ranks else 0 for c in pred_cities], dtype=np.float64)
+        # 模型预测顺序下的绝对增益序列
+        pred_gains = np.array([RANK_TO_GAIN.get(gt_ranks[c], 0.0) if c in gt_ranks else 0.0 for c in pred_cities], dtype=np.float64)
         # 命中标记 (是否为正样本)
         pred_hits = np.array([1 if c in gt_ranks else 0 for c in pred_cities], dtype=np.float64)
-        # 理想排序: GT 的 relevance 降序排列
-        ideal_relevance = np.sort(np.array([21 - r for r in gt_ranks.values()], dtype=np.float64))[::-1]
+        # 理想排序: GT 的增益降序排列
+        ideal_gains = np.sort(np.array([RANK_TO_GAIN.get(r, 0.0) for r in gt_ranks.values()], dtype=np.float64))[::-1]
 
         # MRR: 第一个正样本的位置
         first_hit_positions = np.where(pred_hits > 0)[0]
@@ -180,8 +188,8 @@ def compute_rank_metrics(df: pd.DataFrame, pred_df: pd.DataFrame, k_list: list[i
         row = {'qid': qid, 'gt_size': n_gt, 'mrr': mrr}
 
         for k in k_list:
-            row[f'ndcg@{k}'] = _ndcg_at_k(pred_relevance, ideal_relevance, k)
-            row[f'map@{k}'] = _ap_at_k(pred_hits, k)
+            row[f'ndcg@{k}'] = _ndcg_at_k(pred_gains, ideal_gains, k)
+            row[f'map@{k}'] = _ap_at_k(pred_hits, k, n_gt)
             row[f'precision@{k}'] = float(pred_hits[:k].sum()) / k
             # 同时保留 recall 作为参考
             row[f'recall@{k}'] = float(pred_hits[:k].sum()) / n_gt
@@ -236,6 +244,7 @@ def evaluate_year(model_path: str, year: int, sample_n: int | None,
 def main():
     parser = argparse.ArgumentParser(description="Rank Evaluation (v1 - Ranking Quality Metrics)")
     parser.add_argument("--model", type=str, default=str(DEFAULT_MODEL))
+    parser.add_argument("--model2", type=str, default=None, help="Second model for comparison")
     parser.add_argument("--years", nargs="+", type=int, default=[2019, 2020])
     parser.add_argument("--sample-n", type=int, default=10000,
                         help="Per-year query sample count, 0=full")
@@ -244,86 +253,96 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
-    model_path = args.model
-    if not Path(model_path).exists():
-        raise FileNotFoundError(f"Model not found: {model_path}")
+    model_paths = [args.model]
+    if args.model2:
+        model_paths.append(args.model2)
+
+    for mp in model_paths:
+        if not Path(mp).exists():
+            raise FileNotFoundError(f"Model not found: {mp}")
 
     n_workers = args.workers if args.workers > 0 else os.cpu_count()
     sample_n = args.sample_n if args.sample_n > 0 else None
 
-    print(f"Model:    {model_path}")
+    print(f"Models:   {' vs '.join(model_paths)}")
     print(f"Years:    {args.years}")
     print(f"Sample:   {sample_n or 'ALL'} queries/year")
     print(f"Workers:  {n_workers}")
     print(f"Features: {len(FEATS)}")
     print(f"K values: {K_LIST}")
 
-    results = []
-    for year in args.years:
-        r = evaluate_year(model_path, year, sample_n, n_workers, args.seed)
-        results.append(r)
+    all_model_results = []
+    for model_path in model_paths:
+        print(f"\n{'='*60}\nEvaluating: {Path(model_path).name}\n{'='*60}")
+        results = []
+        for year in args.years:
+            r = evaluate_year(model_path, year, sample_n, n_workers, args.seed)
+            results.append(r)
+        all_model_results.append((model_path, results))
 
     # ── 汇总表 ──
-    print(f"\n{'='*120}")
-    print("Summary (Ranking Quality):")
+    for model_path, results in all_model_results:
+        print(f"\n{'='*120}")
+        print(f"Model: {Path(model_path).name}")
+        print("Summary (Ranking Quality):")
 
-    # NDCG 行
-    header = f"{'Year':<8} {'Queries':<10} {'AvgGT':<8} {'MRR':<10}"
-    for k in K_LIST:
-        header += f" {'NDCG@'+str(k):<10}"
-    print(header)
-    print("-" * 120)
-
-    total_q = 0
-    weighted = {f'ndcg@{k}': 0.0 for k in K_LIST}
-    weighted.update({f'map@{k}': 0.0 for k in K_LIST})
-    weighted.update({f'recall@{k}': 0.0 for k in K_LIST})
-    weighted['mrr'] = 0.0
-
-    for r in results:
-        nq = r['n_queries']
-        line = f"{r['year']:<8} {nq:<10} {r['avg_gt_size']:<8.2f} {r['mrr']:<10.4f}"
+        # NDCG 行
+        header = f"{'Year':<8} {'Queries':<10} {'AvgGT':<8} {'MRR':<10}"
         for k in K_LIST:
-            line += f" {r[f'ndcg@{k}']:<10.4f}"
-        print(line)
-
-        total_q += nq
-        weighted['mrr'] += r['mrr'] * nq
-        for k in K_LIST:
-            weighted[f'ndcg@{k}'] += r[f'ndcg@{k}'] * nq
-            weighted[f'map@{k}'] += r[f'map@{k}'] * nq
-            weighted[f'recall@{k}'] += r[f'recall@{k}'] * nq
-
-    if total_q > 0:
+            header += f" {'NDCG@'+str(k):<10}"
+        print(header)
         print("-" * 120)
-        line = f"{'ALL':<8} {total_q:<10} {'':8} {weighted['mrr']/total_q:<10.4f}"
-        for k in K_LIST:
-            line += f" {weighted[f'ndcg@{k}']/total_q:<10.4f}"
-        print(line)
 
-    # MAP + Recall 补充表
-    print(f"\n{'Year':<8} ", end="")
-    for k in K_LIST:
-        print(f"{'MAP@'+str(k):<10} ", end="")
-    for k in K_LIST:
-        print(f"{'R@'+str(k):<10} ", end="")
-    print()
-    print("-" * 120)
-    for r in results:
-        line = f"{r['year']:<8} "
+        total_q = 0
+        weighted = {f'ndcg@{k}': 0.0 for k in K_LIST}
+        weighted.update({f'map@{k}': 0.0 for k in K_LIST})
+        weighted.update({f'recall@{k}': 0.0 for k in K_LIST})
+        weighted['mrr'] = 0.0
+
+        for r in results:
+            nq = r['n_queries']
+            line = f"{r['year']:<8} {nq:<10} {r['avg_gt_size']:<8.2f} {r['mrr']:<10.4f}"
+            for k in K_LIST:
+                line += f" {r[f'ndcg@{k}']:<10.4f}"
+            print(line)
+
+            total_q += nq
+            weighted['mrr'] += r['mrr'] * nq
+            for k in K_LIST:
+                weighted[f'ndcg@{k}'] += r[f'ndcg@{k}'] * nq
+                weighted[f'map@{k}'] += r[f'map@{k}'] * nq
+                weighted[f'recall@{k}'] += r[f'recall@{k}'] * nq
+
+        if total_q > 0:
+            print("-" * 120)
+            line = f"{'ALL':<8} {total_q:<10} {'':8} {weighted['mrr']/total_q:<10.4f}"
+            for k in K_LIST:
+                line += f" {weighted[f'ndcg@{k}']/total_q:<10.4f}"
+            print(line)
+
+        # MAP + Recall 补充表
+        print(f"\n{'Year':<8} ", end="")
         for k in K_LIST:
-            line += f"{r[f'map@{k}']:<10.4f} "
+            print(f"{'MAP@'+str(k):<10} ", end="")
         for k in K_LIST:
-            line += f"{r[f'recall@{k}']:<10.4f} "
-        print(line)
-    if total_q > 0:
+            print(f"{'R@'+str(k):<10} ", end="")
+        print()
         print("-" * 120)
-        line = f"{'ALL':<8} "
-        for k in K_LIST:
-            line += f"{weighted[f'map@{k}']/total_q:<10.4f} "
-        for k in K_LIST:
-            line += f"{weighted[f'recall@{k}']/total_q:<10.4f} "
-        print(line)
+        for r in results:
+            line = f"{r['year']:<8} "
+            for k in K_LIST:
+                line += f"{r[f'map@{k}']:<10.4f} "
+            for k in K_LIST:
+                line += f"{r[f'recall@{k}']:<10.4f} "
+            print(line)
+        if total_q > 0:
+            print("-" * 120)
+            line = f"{'ALL':<8} "
+            for k in K_LIST:
+                line += f"{weighted[f'map@{k}']/total_q:<10.4f} "
+            for k in K_LIST:
+                line += f"{weighted[f'recall@{k}']/total_q:<10.4f} "
+            print(line)
 
     print("=" * 120)
 

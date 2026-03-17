@@ -66,16 +66,24 @@ def main():
     
     print(f"✅ 数据加载完毕！耗时仅 {(time.time() - t0):.2f} 秒。")
 
-    # 🚀 强行构建一张长度为 128 的换算表，把我们的标签原封不动地映射为绝对得分
+    # ==============================================================================
+    # 🎯 工业级黑魔法：指数级梯度换算表 (强保 Top-10)
+    # ==============================================================================
     custom_label_gain = [0] * 128
-    custom_label_gain[127] = 127
-    custom_label_gain[63]  = 63
-    custom_label_gain[31]  = 31
-    custom_label_gain[15]  = 15
-    custom_label_gain[7]   = 7
-    custom_label_gain[3]   = 3
-    custom_label_gain[2]   = 2
-    custom_label_gain[1]   = 1
+
+    # Top 1-5：百万/十万级梯度（核心中的核心，生死红线）
+    custom_label_gain[127] = (1 << 20) - 1  # 1,048,575  (Top 1)
+    custom_label_gain[63]  = (1 << 19) - 1  # 524,287    (Top 2)
+    custom_label_gain[31]  = (1 << 18) - 1  # 262,143    (Top 3)
+    custom_label_gain[15]  = (1 << 17) - 1  # 131,071    (Top 4)
+    custom_label_gain[7]   = (1 << 16) - 1  # 65,535     (Top 5)
+
+    # Top 6-7：万级梯度（次要核心）
+    custom_label_gain[3]   = (1 << 15) - 1  # 32,767     (Top 6)
+    custom_label_gain[2]   = (1 << 14) - 1  # 16,383     (Top 7)
+
+    # Top 8-20：千级梯度（温和兜底，只求召回不求绝对顺序）
+    custom_label_gain[1]   = (1 << 12) - 1  # 4,095      (Top 8-20)
 
     params = {
         # 🎯 核心算法回调 1：换回 lambdarank，天然专一于头部排序
@@ -86,8 +94,8 @@ def main():
         # 🎯 核心破解：注入自定义换算表，完美解决 31 级溢出报错
         'label_gain': custom_label_gain,
 
-        # 🎯 核心算法回调 2：告诉模型算梯度时只看前 10 名
-        'lambdarank_truncation_level': 10,
+        # 🎯 视野锁死前 20，配合强梯度实现算力极致聚焦
+        'lambdarank_truncation_level': 20,
 
         'boosting_type': 'gbdt',
         'learning_rate': 0.05,
