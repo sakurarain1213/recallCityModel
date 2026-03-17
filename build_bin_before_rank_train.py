@@ -12,13 +12,7 @@ from tqdm import tqdm
 # ================= 极速存储路径 =================
 BASE_DIR = Path("output/base_ready")
 CACHE_DIR = Path("data/city_pair_cache")
-BIN_OUTPUT_DIR = Path("/data2/wxj/recall_bin") 
-
-# 🎯 方案 B：彻底清空旧的二进制缓存，保证数据绝对干净
-if BIN_OUTPUT_DIR.exists():
-    print(f"🧹 正在彻底清空旧缓存目录: {BIN_OUTPUT_DIR} ...")
-    shutil.rmtree(BIN_OUTPUT_DIR)
-BIN_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+BIN_OUTPUT_DIR = Path("/data2/wxj/recall_bin")
 
 # ================= 特征定义 =================
 PERSON_CATS = ['gender', 'age_group', 'education', 'industry', 'income', 'family']
@@ -239,6 +233,12 @@ def build_and_save_bin(years, split_name, max_rows, sample_ratio, is_train, refe
     return ds
 
 if __name__ == '__main__':
+    # 🎯 彻底清空旧的二进制缓存，保证数据绝对干净
+    if BIN_OUTPUT_DIR.exists():
+        print(f"🧹 正在彻底清空旧缓存目录: {BIN_OUTPUT_DIR} ...")
+        shutil.rmtree(BIN_OUTPUT_DIR)
+    BIN_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
     TRAIN_MAX_ROWS = 400_000_000
     VAL_MAX_ROWS   = 50_000_000
 
