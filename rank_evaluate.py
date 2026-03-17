@@ -40,7 +40,7 @@ from build_bin_before_rank_train import (
     BASE_DIR, CACHE_DIR,
 )
 
-DEFAULT_MODEL = Path("output\models\model_v10_lambdarank_top10.txt")
+DEFAULT_MODEL = Path("output/models/model_v10_lambdarank_top10.txt")
 K_LIST = [5, 10, 15, 20]
 
 
@@ -199,6 +199,37 @@ def compute_rank_metrics(df: pd.DataFrame, pred_df: pd.DataFrame, k_list: list[i
     return pd.DataFrame(rows)
 
 
+def print_model_info(model_path: str):
+    """打印模型基本信息和特征重要性"""
+    model = lgb.Booster(model_file=model_path)
+
+    print(f"\n{'='*60}")
+    print(f"Model Info: {Path(model_path).name}")
+    print(f"{'='*60}")
+
+    # 基本参数
+    params = model.params
+    print(f"Objective:       {params.get('objective', 'N/A')}")
+    print(f"Num Trees:       {model.num_trees()}")
+    print(f"Num Features:    {model.num_feature()}")
+    print(f"Learning Rate:   {params.get('learning_rate', 'N/A')}")
+    print(f"Num Leaves:      {params.get('num_leaves', 'N/A')}")
+    print(f"Max Depth:       {params.get('max_depth', 'N/A')}")
+
+    # 特征重要性 Top 20
+    feats = model.feature_name()
+    importance = model.feature_importance('gain')
+    imp_df = pd.DataFrame({'feature': feats, 'importance': importance})
+    imp_df = imp_df.sort_values('importance', ascending=False).head(20)
+
+    print(f"\nTop 20 Features (by gain):")
+    print(f"{'Rank':<6} {'Feature':<40} {'Importance':>15}")
+    print("-" * 61)
+    for idx, row in enumerate(imp_df.itertuples(), 1):
+        print(f"{idx:<6} {row.feature:<40} {row.importance:>15,.0f}")
+    print(f"{'='*60}\n")
+
+
 def evaluate_year(model_path: str, year: int, sample_n: int | None,
                   n_workers: int, seed: int = 42) -> dict:
     t0 = time.time()
@@ -273,6 +304,7 @@ def main():
 
     all_model_results = []
     for model_path in model_paths:
+        print_model_info(model_path)
         print(f"\n{'='*60}\nEvaluating: {Path(model_path).name}\n{'='*60}")
         results = []
         for year in args.years:
