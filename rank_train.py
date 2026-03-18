@@ -67,32 +67,35 @@ def main():
     print(f"✅ 数据加载完毕！耗时仅 {(time.time() - t0):.2f} 秒。")
 
     # ==============================================================================
-    # 🎯 删除 custom_label_gain，使用框架默认的 2^rel - 1 增益
+    # 🎯 二次方自定义增益：温和梯度，Top 1-10 每名都有清晰信号
+    # Rel: 0→0, 1→1, 2→3, 3→5, 4→7, 5→10, 6→14, 7→19, 8→25, 9→32, 10→40, 11→50
     # ==============================================================================
+    custom_label_gain = [0, 1, 3, 5, 7, 10, 14, 19, 25, 32, 40, 50]
+
     params = {
-        # 🎯 核心算法：lambdarank，专注头部排序
         'objective': 'lambdarank',
         'metric': 'ndcg',
-        'ndcg_eval_at': [5, 10, 20],
+        'ndcg_eval_at': [10, 5, 20],
 
-        # 🎯 删除 label_gain，使用默认增益（Rel 7->127, 6->63, 5->31...）
+        # 🎯 注入二次方增益，替代默认的指数增益
+        'label_gain': custom_label_gain,
 
-        # 🎯 截断层级放宽到 30，防止暂时掉队的 Top-1 样本失去梯度
-        'lambdarank_truncation_level': 30,
+        # 🎯 截断锁死 Top-10，不浪费算力在 11-20 的内部排序上
+        'lambdarank_truncation_level': 10,
 
         'boosting_type': 'gbdt',
-        'learning_rate': 0.02,      # 降低学习率，精雕细琢
-        'num_leaves': 127,          # 增加叶子数，提升模型容量
+        'learning_rate': 0.02,
+        'num_leaves': 127,
         'max_depth': 10,
-        'n_estimators': 8000,       # 配合低学习率增加树数量
+        'n_estimators': 8000,
         'num_threads': 38,
         'max_bin': 255,
         'feature_fraction': 0.7,
         'bagging_fraction': 0.8,
         'bagging_freq': 1,
-        'lambda_l1': 0.5,           # 增加 L1 正则
-        'lambda_l2': 2.0,           # 增加 L2 防止过拟合
-        'min_child_samples': 200,   # 🎯 关键：从 1000 降到 200，学习细粒度特征
+        'lambda_l1': 0.5,
+        'lambda_l2': 2.0,
+        'min_child_samples': 200,
         'force_col_wise': True,
         'verbosity': -1,
     }

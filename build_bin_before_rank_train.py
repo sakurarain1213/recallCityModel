@@ -33,8 +33,9 @@ CACHE_FEAT_COLS = RATIO_FEATS + DIFF_FEATS + ABS_FEATS + NET_DIST_FEATS
 
 HARD_NEG_CITIES_SET = {1100, 3100, 4401, 4403, 1200, 3201, 3205, 3301, 3302, 3401, 3702, 4101, 4201, 4301, 4406, 4419, 5000, 5101, 6101, 1301, 1401, 2101, 2102, 2201, 2301, 3202, 3203, 3204, 3206, 3303, 3304, 3306, 3307, 3310, 3501, 3502, 3505, 3601, 3701, 3706, 3707, 3713, 4404, 4413, 4420, 4501, 4601, 5201, 5301, 6501}
 
-# 🚀 负样本数量：提升到 120，增加模型见识（Hard Neg 已经帮我们省内存了）
-N_RAND_NEG = 120
+# 🚀 负样本数量：提升到 200，增加模型见识（Hard Neg 已经帮我们省内存了）
+# 核心
+N_RAND_NEG = 200
 
 def _get_mem_gb():
     return psutil.Process().memory_info().rss / 1024**3
@@ -94,23 +95,23 @@ def _process_single_year(year: int, sample_ratio: float, random_seed: int, is_tr
     rank = base['Rank'].values
 
     # =====================================================================
-    # 🎯 改进版：连续整数 Relevance (0-7)，利用框架默认 2^rel-1 增益
+    # 🎯 死磕 Top-10：1-10 名严格递减 Relevance (11→2)，11-20 名兜底 (1)
     # =====================================================================
     relevance = np.zeros_like(rank, dtype=np.int8)
 
-    # Top 1-5：死磕精度 (Rel 7->Gain 127, Rel 6->Gain 63, ...)
-    relevance[rank == 1] = 7
-    relevance[rank == 2] = 6
-    relevance[rank == 3] = 5
-    relevance[rank == 4] = 4
-    relevance[rank == 5] = 3
+    relevance[rank == 1] = 11
+    relevance[rank == 2] = 10
+    relevance[rank == 3] = 9
+    relevance[rank == 4] = 8
+    relevance[rank == 5] = 7
+    relevance[rank == 6] = 6
+    relevance[rank == 7] = 5
+    relevance[rank == 8] = 4
+    relevance[rank == 9] = 3
+    relevance[rank == 10] = 2
 
-    # Top 6-15：平滑过渡（用户平均选14个城市，这些都是真样本）
-    relevance[(rank >= 6) & (rank <= 10)] = 2   # Gain 3
-    relevance[(rank >= 11) & (rank <= 15)] = 1  # Gain 1
-
-    # Top 16-20：兜底（只要排在负样本前即可）
-    relevance[(rank >= 16) & (rank <= 20)] = 1
+    # Top 11-20：弱正样本兜底，只要排在负样本前面即可
+    relevance[(rank >= 11) & (rank <= 20)] = 1
 
     base['Relevance'] = relevance
     qids = base['qid'].values
@@ -259,6 +260,7 @@ if __name__ == '__main__':
     TRAIN_MAX_ROWS = 400_000_000
     VAL_MAX_ROWS   = 50_000_000
 
+    # 核心 样本采样率：Train 30%，Val 20%  
     # 先构建 Train，并获取其 Dataset 对象
     train_dataset = build_and_save_bin(list(range(2000, 2017)), "Train", TRAIN_MAX_ROWS, 0.3, True, reference_ds=None)
     
