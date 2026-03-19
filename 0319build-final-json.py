@@ -267,32 +267,71 @@ def infer_single_city(
     return lines
 
 
+TYPE_FEATURES_PATH = Path("data/type_features.jsonl")
+
+def _load_all_city_ids() -> list[int]:
+    """从 type_features.jsonl 提取去重城市 ID, 保证与 type 列表完全一致 (295 cities)"""
+    import json as _json
+    seen = set()
+    cities = []
+    with open(TYPE_FEATURES_PATH, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                tid = _json.loads(line)['id']
+                city = int(tid.rsplit('_', 1)[1])
+                if city not in seen:
+                    seen.add(city)
+                    cities.append(city)
+    return cities
+
+# 全量城市列表 (模块级缓存, 来自 type_features.jsonl 的 295 个城市)
+ALL_CITY_IDS = _load_all_city_ids()
+
+
+def _build_all_person_combinations() -> np.ndarray:
+    """笛卡尔积生成全部 1200 种画像组合, 从根本上杜绝重复"""
+    from itertools import product
+    combos = list(product(
+        range(len(GENDER_REV)),   # 2
+        range(len(AGE_REV)),      # 5
+        range(len(EDU_REV)),      # 3
+        range(len(IND_REV)),      # 4
+        range(len(INC_REV)),      # 5
+        range(len(FAM_REV)),      # 2
+    ))  # 2*5*3*4*5*2 = 1200
+    return np.array(combos, dtype=np.float32)
+
+# 模块级缓存: 全部 1200 种画像, 所有 worker 共用
+_ALL_PERSONS = _build_all_person_combinations()
+
+
 def load_feather_groups(year: int) -> tuple[list[tuple[int, np.ndarray, np.ndarray]], int]:
-    """神速解析 Feather: drop_duplicates 秒速提取, 杜绝 sort_values OOM"""
-    feather_path = FEATHER_DIR / f"base_{year}.feather"
+    """全量城市 × 全排列画像, 天然不重不漏 (295 cities × 1200 persons = 354,000 types)"""
+    # 从 cache parquet 提取每个 from_city 的 to_city 候选池
+    cache_path = CACHE_DIR / f"city_pairs_{year}.parquet"
+    pair_df = pd.read_parquet(cache_path, columns=['from_city', 'to_city'])
+    to_city_map = pair_df.groupby('from_city')['to_city'].apply(
+        lambda x: x.values.astype(np.int32)).to_dict()
+    del pair_df
 
-    df = pd.read_feather(feather_path, columns=['qid', 'From_City', 'To_City',
-                                                  'gender', 'age_group', 'education',
-                                                  'industry', 'income', 'family'])
-
-    person_cols = ['gender', 'age_group', 'education', 'industry', 'income', 'family']
-
-    # 直接去重提取人口基准数据 (几百毫秒)
-    person_df = df.drop_duplicates(subset=['qid'])
-
-    # 提取候选城市池: 每个 from_city 取第一个 qid 的所有 to_city
-    first_qids_per_city = person_df.groupby('From_City', sort=False)['qid'].first().values
-    to_city_df = df[df['qid'].isin(set(first_qids_per_city))][['From_City', 'To_City']]
+    person_arr = _ALL_PERSONS  # (1200, 6)
 
     groups = []
-    n_total = len(person_df)
+    skipped = 0
+    for fc in ALL_CITY_IDS:
+        t_arr = to_city_map.get(fc)
+        if t_arr is None:
+            skipped += 1
+            continue
+        groups.append((fc, person_arr, t_arr))
 
-    for from_city, group in person_df.groupby('From_City', sort=False):
-        p_arr = group[person_cols].values.astype(np.float32)
-        t_arr = to_city_df[to_city_df['From_City'] == from_city]['To_City'].values.astype(np.int32)
-        groups.append((int(from_city), p_arr, t_arr))
+    n_total = len(groups) * len(person_arr)
+    msg = f"  [Year {year}] {len(groups)} cities × {len(person_arr)} persons = {n_total:,} types"
+    if skipped:
+        msg += f" (skipped {skipped} cities not in cache)"
+    print(msg)
 
-    del df, person_df, to_city_df
     return groups, n_total
 
 
@@ -371,6 +410,21 @@ def process_year_worker(
         raise
 
     del cache_tensor, city_map, feather_groups
+
+    # 快速校验: 检查 jsonl 中 key 是否有重复
+    import json as _json
+    keys = []
+    with open(out_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                keys.append(next(iter(_json.loads(line))))
+    n_keys = len(keys)
+    n_unique = len(set(keys))
+    if n_keys != n_unique:
+        print(f"  [Year {year}] WARNING: {n_keys - n_unique} 个重复 key! ({n_keys} total, {n_unique} unique)")
+    else:
+        print(f"  [Year {year}] OK: {n_unique:,} unique keys, 无重复")
 
     # 更新共享状态: 完成
     _shared_phase[worker_slot] = 3  # done
@@ -454,10 +508,8 @@ def main():
     else:
         lgb_threads = max(1, cpu_total // year_workers)
 
-    # 预读 TypeID 总数
-    sample_df = pd.read_feather(FEATHER_DIR / f"base_{valid_years[0]}.feather", columns=['qid'])
-    per_year_total = sample_df['qid'].nunique()
-    del sample_df
+    # 预算 TypeID 总数: type_features.jsonl 的 295 城市 × 1200 画像
+    per_year_total = len(ALL_CITY_IDS) * len(_ALL_PERSONS)  # 295 × 1200 = 354,000
     grand_total = per_year_total * len(valid_years)
 
     infer_mode = "tl2cgen (compiled C++)" if str(model_path).endswith('.so') and HAS_TL2CGEN else "LightGBM (native)"
