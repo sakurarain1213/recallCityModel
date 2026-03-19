@@ -3,6 +3,7 @@ import treelite
 import tl2cgen
 import time
 
+# 注意只能在Linux上运行 
 orig_path = "output/models/0319recall_model_final.txt"
 trunc_path = "output/models/0319recall_model_trunc.txt"
 so_path = "output/models/0319recall_model_trunc.so"
