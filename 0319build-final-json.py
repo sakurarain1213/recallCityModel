@@ -13,7 +13,7 @@
       uv run 0319build-final-json.py --year-workers 5 --lgb-threads 8
 
 
-uv run tmp.py --model output/models/0319recall_model_final.so --year-workers 5 --lgb-threads 8 --max-mem-gb 90
+ uv run tmp.py --model output/models/0319recall_model_trunc.so --year-workers 5 --lgb-threads 8 --max-mem-gb 180 
 
 """
 
@@ -51,7 +51,7 @@ import lightgbm as lgb
 # 路径配置
 # ═══════════════════════════════════════════════════════════════
 MODEL_PATH = Path("output/models/0319recall_model_final.txt")
-MODEL_SO_PATH = Path("output/models/0319recall_model_final.so")
+MODEL_SO_PATH = Path("output/models/0319recall_model_trunc.so")
 CACHE_DIR = Path("data/city_pair_cache")
 FEATHER_DIR = Path("output/base_ready")
 OUTPUT_DIR = Path("recall_result")
