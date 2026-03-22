@@ -169,8 +169,12 @@ def load_cache(year: int):
     return tensor, city_map, to_dict
 
 
-def build_year_data(year: int, sample_n: int = None, seed: int = 42):
-    """从 DB 加载 year 数据，返回 (X, labels, qids, n_queries)"""
+def build_year_data(year: int, sample_n: int = None, neg_sample_n: int = 200, seed: int = 42):
+    """从 DB 加载 year 数据，返回 (X, labels, qids, n_queries)
+
+    Args:
+        neg_sample_n: 每个 query 保留多少个负样本 (默认 200)。设为 None 则保留全部 (336)。
+    """
     t0 = time.time()
     top_cols = ', '.join([f'To_Top{i}' for i in range(1, 21)])
     sql = f"SELECT Type_ID, {top_cols} FROM migration_data WHERE Year = {year}"
@@ -206,17 +210,19 @@ def build_year_data(year: int, sample_n: int = None, seed: int = 42):
     hous_i = RATIO_FEATS.index('housing_price_avg_ratio')
     edu_i = RATIO_FEATS.index('education_score_ratio')
 
-    total = n_q * 336
-    X = np.zeros((total, len(FEATS)), dtype=np.float32)
-    labels = np.zeros(total, dtype=np.int8)
-    qids = np.zeros(total, dtype=np.int32)
+    # 预估行数：每 query 约 20 正 + neg_sample_n 负
+    avg_per_q = (20 + (neg_sample_n or 336))
+    est_total = n_q * avg_per_q
+    X = np.empty((int(est_total * 1.1), len(FEATS)), dtype=np.float32)
+    labels = np.empty(int(est_total * 1.1), dtype=np.int8)
+    qids = np.empty(int(est_total * 1.1), dtype=np.int32)
 
+    rng = np.random.default_rng(seed + year)
     row = 0
+    valid_q = 0
     t1 = time.time()
-    # 预估时间
-    est_time_per_q = 0.0005  # 每query预估秒数，根据数据规模调整
-    est_total = n_q * est_time_per_q
-    print(f"  预估耗时: {est_total:.1f}s (~{est_total/60:.1f}min)")
+    est_per_q = 0.0004
+    print(f"  预估耗时: {n_q * est_per_q:.1f}s (~{n_q * est_per_q / 60:.1f}min)")
 
     for q in tqdm(range(n_q), desc=f"Build {year}", unit="query"):
         fc = from_cities[q]
@@ -224,7 +230,6 @@ def build_year_data(year: int, sample_n: int = None, seed: int = 42):
         all_to = to_dict.get(fc, np.array([], dtype=np.int32))
 
         if len(all_to) == 0:
-            n_q -= 1
             continue
 
         if len(all_to) < 336:
@@ -232,12 +237,33 @@ def build_year_data(year: int, sample_n: int = None, seed: int = 42):
         else:
             all_to = all_to[:336]
 
-        pf = tensor[fc, city_map[all_to], :]
+        # 先算标签，确定要保留哪些
+        lbl = np.array([1 if tc in pos else 0 for tc in all_to], dtype=np.int8)
+
+        pos_idx = np.where(lbl > 0)[0]
+        neg_idx = np.where(lbl == 0)[0]
+
+        if neg_sample_n is not None:
+            n_neg_keep = min(neg_sample_n, len(neg_idx))
+            neg_keep = rng.choice(neg_idx, size=n_neg_keep, replace=False) if n_neg_keep > 0 else np.array([], dtype=np.int64)
+            keep_idx = np.concatenate([pos_idx, neg_keep])
+        else:
+            keep_idx = np.arange(336)
+
+        keep_idx.sort()
+        n_keep = len(keep_idx)
+        if n_keep == 0:
+            continue
+
+        kept_all_to = all_to[keep_idx]
+
+        # 只提取保留下来的候选的特征
+        pf = tensor[fc, city_map[kept_all_to], :]
         pf = np.nan_to_num(pf, nan=0.0)
-        pf_base = np.concatenate([np.tile(persons[q], (336, 1)), pf], axis=1)
+        pf_base = np.concatenate([np.tile(persons[q], (n_keep, 1)), pf], axis=1)
 
         ind = int(persons[q][3])
-        cross = np.zeros((336, 6), dtype=np.float32)
+        cross = np.zeros((n_keep, 6), dtype=np.float32)
         cross[:, 0] = pf[:, wage_i[min(ind, 3)]]
         cross[:, 1] = pf[:, vac_i[min(ind, 3)]]
         cross[:, 2] = persons[q][2] * pf[:, tier_i]
@@ -246,30 +272,31 @@ def build_year_data(year: int, sample_n: int = None, seed: int = 42):
         cross[:, 5] = persons[q][5] * pf[:, edu_i]
 
         feat = np.ascontiguousarray(np.concatenate([pf_base, cross], axis=1), dtype=np.float32)
-        lbl = np.array([1 if tc in pos else 0 for tc in all_to], dtype=np.int8)
+        lbl_kept = lbl[keep_idx]
 
-        X[row:row+336] = feat
-        labels[row:row+336] = lbl
-        qids[row:row+336] = q
-        row += 336
+        X[row:row+n_keep] = feat
+        labels[row:row+n_keep] = lbl_kept
+        qids[row:row+n_keep] = valid_q
+        row += n_keep
+        valid_q += 1
 
+    print(f"  Built {row:,} rows, {valid_q:,} queries ({time.time()-t1:.1f}s)")
     X = X[:row]; labels = labels[:row]; qids = qids[:row]
-    print(f"  Built {len(X):,} rows, {row//336:,} queries ({time.time()-t1:.1f}s)")
     del tensor, city_map, to_dict; gc.collect()
-    return X, labels, qids, row // 336
+    return X, labels, qids, valid_q
 
 
 # ═══════════════════════════════════════════════════════════════
 # Bin 构建
 # ═══════════════════════════════════════════════════════════════
 
-def build_bin(year: int, is_train: bool, sample_n: int = None):
+def build_bin(year: int, is_train: bool, sample_n: int = None, neg_sample_n: int = 200):
     print(f"\n[{'Train' if is_train else 'Val'} {year}]")
     suffix = "Train" if is_train else "Val"
-    X, labels, qids, n_q = build_year_data(year, sample_n=sample_n)
+    X, labels, qids, n_q = build_year_data(year, sample_n=sample_n, neg_sample_n=neg_sample_n if is_train else None)
 
     print(f"  构建 Dataset...")
-    groups = np.full(n_q, 336, dtype=np.int32)
+    groups = np.diff(np.r_[0, np.where(np.diff(qids) != 0)[0] + 1, len(qids)])
     n_rows = len(X)
 
     ds = lgb.Dataset(X, label=labels, feature_name=list(FEATS),
@@ -300,9 +327,16 @@ def train(train_bin_info, val_years, query_ratio=1.0, neg_ratio=1.0):
     t0 = time.time()
     print("\n=== Train ===")
 
-    # 核心技巧：用逗号拼接多个 bin 文件路径，LightGBM C++ 底层自动合并
-    bin_paths = [str(p) for p, _, _ in train_bin_info]
-    train_ds = lgb.Dataset(",".join(bin_paths))
+    # 优先使用合并后的单一 bin 文件
+    merged_bin = BIN_DIR / "train_all.bin"
+    if merged_bin.exists():
+        print(f"  使用合并的 bin 文件: {merged_bin}")
+        train_ds = lgb.Dataset(str(merged_bin))
+    else:
+        # 降级: 用逗号拼接多个 bin 文件路径，LightGBM C++ 底层自动合并
+        bin_paths = [str(p) for p, _, _ in train_bin_info]
+        print(f"  未找到 {merged_bin.name}，使用 {len(bin_paths)} 个单独 bin")
+        train_ds = lgb.Dataset(",".join(bin_paths))
 
     # 必须先 construct 载入内存，否则无法获取 label 和 group 进行动态切分
     print("  Constructing Dataset (加载合并的 bin 文件中，请稍候)...")
@@ -432,7 +466,7 @@ def evaluate(model_path: str, years, sample_n=5000):
         X, labels, qids, n_q = build_year_data(year, sample_n=sample_n)
         scores = model.predict(X)
 
-        groups = np.full(n_q, 336, dtype=np.int32)
+        groups = np.diff(np.r_[0, np.where(np.diff(qids) != 0)[0] + 1, len(qids)])
         splits = np.r_[0, np.cumsum(groups)]
         lbl_sp = np.split(labels, splits[1:-1])
         sc_sp = np.split(scores, splits[1:-1])
@@ -479,6 +513,8 @@ def main():
                    help="训练集每 year 采样 query 数 (默认 None 即全量)")
     p.add_argument("--val-sample", type=int, default=None,
                    help="验证集每 year 采样 query 数 (默认 None 即全量)")
+    p.add_argument("--neg-sample", type=int, default=200,
+                   help="每个 query 最多保留多少个负样本 (默认 200, 设为 None 保留全部 336)")
 
     # 训练时的动态比例配置
     p.add_argument("--train-query-ratio", type=float, default=1.0,
@@ -508,15 +544,36 @@ def main():
         print("\n### STEP: Build Bin ###")
         train_bins = []
         for y in args.train_years:
-            bp = build_bin(y, is_train=True, sample_n=args.sample)
+            bp = build_bin(y, is_train=True, sample_n=args.sample, neg_sample_n=args.neg_sample)
             train_bins.append(bp)
         val_bins = []
         for y in args.val_years:
-            bp = build_bin(y, is_train=False, sample_n=args.val_sample)
+            bp = build_bin(y, is_train=False, sample_n=args.val_sample, neg_sample_n=None)
             val_bins.append(bp)
     else:
-        train_bins = [(BIN_DIR / f"train_{y}.bin", 0, 0) for y in args.train_years]
-        val_bins = [(BIN_DIR / f"val_{y}.bin", 0, 0) for y in args.val_years]
+        # 只加载真实存在的 bin 文件，避免 LightGBM 找不到文件报错
+        train_bins = []
+        for y in args.train_years:
+            bp = BIN_DIR / f"train_{y}.bin"
+            if bp.exists():
+                train_bins.append((bp, 0, 0))
+            else:
+                print(f"  [Warning] 跳过不存在的训练 bin: {bp.name}")
+
+        val_bins = []
+        for y in args.val_years:
+            bp = BIN_DIR / f"val_{y}.bin"
+            if bp.exists():
+                val_bins.append((bp, 0, 0))
+            else:
+                print(f"  [Warning] 跳过不存在的验证 bin: {bp.name}")
+
+        if not train_bins:
+            raise FileNotFoundError(
+                f"[Error] 没有找到任何可用的训练 bin 文件！\n"
+                f"  请先运行 --step bin 生成 bin 文件:\n"
+                f"    python 0322pipeline.py --step bin"
+            )
 
     # Step 2: Train
     if do_all or "train" in steps:
