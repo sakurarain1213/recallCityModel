@@ -51,42 +51,6 @@ MODEL_DIR.mkdir(parents=True, exist_ok=True)
 # Callbacks
 # ═══════════════════════════════════════════════════════════════
 
-class CheckpointCallback:
-    """每 N 轮保存一次 checkpoint"""
-    def __init__(self, output_dir, freq=20):
-        self.output_dir = Path(output_dir) / "checkpoints"
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.freq = freq
-        self.before_iteration = False
-
-    def __call__(self, env):
-        current_round = env.iteration + 1
-        if current_round % self.freq == 0:
-            ckpt_path = self.output_dir / f"ltr_model_iter_{current_round}.txt"
-            env.model.save_model(str(ckpt_path))
-            print(f"    [Checkpoint] iter {current_round} -> {ckpt_path.name}")
-
-
-class TimingCallback:
-    """计时器：显示速度和预估剩余时间"""
-    def __init__(self, freq=20, total_iters=2000):
-        self.freq = freq
-        self.total_iters = total_iters
-        self.start_time = None
-        self.before_iteration = False
-
-    def __call__(self, env):
-        if self.start_time is None:
-            self.start_time = time.time()
-        current_round = env.iteration + 1
-        if current_round % self.freq == 0:
-            elapsed = time.time() - self.start_time
-            speed = current_round / elapsed * 60
-            remaining = (self.total_iters - current_round) / speed if speed > 0 else 0
-            print(f"    [Timer] iter {current_round}/{self.total_iters} | "
-                  f"elapsed {elapsed/60:.1f}min | "
-                  f"speed {speed:.1f} iter/min | "
-                  f"ETA ~{remaining:.1f}min")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -213,7 +177,7 @@ def build_year_data(year: int, sample_n: int = None, neg_sample_n: int = 200, se
     # 预估行数：每 query 约 20 正 + neg_sample_n 负
     avg_per_q = (20 + (neg_sample_n or 336))
     est_total = n_q * avg_per_q
-    X = np.empty((int(est_total * 1.1), len(FEATS)), dtype=np.float32)
+    X = np.empty((int(est_total * 1.1), len(FEATS)), dtype=np.float16)
     labels = np.empty(int(est_total * 1.1), dtype=np.int8)
     qids = np.empty(int(est_total * 1.1), dtype=np.int32)
 
@@ -271,7 +235,7 @@ def build_year_data(year: int, sample_n: int = None, neg_sample_n: int = 200, se
         cross[:, 4] = persons[q][1] * pf[:, hous_i]
         cross[:, 5] = persons[q][5] * pf[:, edu_i]
 
-        feat = np.ascontiguousarray(np.concatenate([pf_base, cross], axis=1), dtype=np.float32)
+        feat = np.ascontiguousarray(np.concatenate([pf_base, cross], axis=1), dtype=np.float16)
         lbl_kept = lbl[keep_idx]
 
         X[row:row+n_keep] = feat
@@ -290,24 +254,41 @@ def build_year_data(year: int, sample_n: int = None, neg_sample_n: int = 200, se
 # Bin 构建
 # ═══════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════
+# Bin 构建 (修复线程争用，增加耗时监控)
+# ═══════════════════════════════════════════════════════════════
+
 def build_bin(year: int, is_train: bool, sample_n: int = None, neg_sample_n: int = 200):
     print(f"\n[{'Train' if is_train else 'Val'} {year}]")
     suffix = "Train" if is_train else "Val"
     X, labels, qids, n_q = build_year_data(year, sample_n=sample_n, neg_sample_n=neg_sample_n if is_train else None)
 
-    print(f"  构建 Dataset...")
     groups = np.diff(np.r_[0, np.where(np.diff(qids) != 0)[0] + 1, len(qids)])
     n_rows = len(X)
 
+    print(f"  构建 Dataset (处理 48 亿个特征点，预计需 1~3 分钟，请稍候)...")
+    t_construct = time.time()
+
+    # 【关键修复】加上 num_threads 限制，防止服务器几十个核心抢爆内存总线
     ds = lgb.Dataset(X, label=labels, feature_name=list(FEATS),
                      categorical_feature=CATS, free_raw_data=True,
-                     params={'max_bin': 255})
+                     params={
+                         'max_bin': 255,
+                         'num_threads': 16,             # 限制线程数为 16（如果还是很慢，可尝试降到 8）
+                         'bin_construct_sample_cnt': 200000 # 显式指定分箱采样数，避免全量扫描算边界
+                     })
     ds.set_group(groups)
     ds.construct()
 
+    print(f"  => Dataset 分箱构建完成！耗时: {time.time()-t_construct:.1f}s")
+
     suffix = "train" if is_train else "val"
     bin_path = BIN_DIR / f"{suffix}_{year}.bin"
+
+    print(f"  正在将 Bin 写入硬盘 (约几 GB)...")
+    t_save = time.time()
     ds.save_binary(str(bin_path))
+    print(f"  => 落盘完成！耗时: {time.time()-t_save:.1f}s")
 
     if not is_train:
         np.save(BIN_DIR / f"val_labels_{year}.npy", labels)
@@ -323,79 +304,9 @@ def build_bin(year: int, is_train: bool, sample_n: int = None, neg_sample_n: int
 # ═══════════════════════════════════════════════════════════════
 
 def train(train_bin_info, val_years, query_ratio=1.0, neg_ratio=1.0):
-    """train_bin_info: list of (bin_path, n_rows, n_q)"""
     t0 = time.time()
-    print("\n=== Train ===")
+    print("\n=== Train (每年独立加载，轮转增量训练) ===")
 
-    # 优先使用合并后的单一 bin 文件
-    merged_bin = BIN_DIR / "train_all.bin"
-    if merged_bin.exists():
-        print(f"  使用合并的 bin 文件: {merged_bin}")
-        train_ds = lgb.Dataset(str(merged_bin))
-    else:
-        # 降级: 用逗号拼接多个 bin 文件路径，LightGBM C++ 底层自动合并
-        bin_paths = [str(p) for p, _, _ in train_bin_info]
-        print(f"  未找到 {merged_bin.name}，使用 {len(bin_paths)} 个单独 bin")
-        train_ds = lgb.Dataset(",".join(bin_paths))
-
-    # 必须先 construct 载入内存，否则无法获取 label 和 group 进行动态切分
-    print("  Constructing Dataset (加载合并的 bin 文件中，请稍候)...")
-    train_ds.construct()
-    total_train = train_ds.num_data()
-    print(f"  Original Train Dataset: {total_train:,} rows")
-
-    # ═══════════════════════════════════════════════════════════════
-    # 动态采样逻辑 (Query 级抽样 + 组内负采样)
-    # ═══════════════════════════════════════════════════════════════
-    if query_ratio < 1.0 or neg_ratio < 1.0:
-        print(f"  => 动态采样中 (Query Ratio: {query_ratio:.2f}, Neg Ratio: {neg_ratio:.2f})...")
-        labels = train_ds.get_label()
-        groups = train_ds.get_group()
-        splits = np.r_[0, np.cumsum(groups)]
-        n_queries = len(groups)
-
-        # 1. 抽取特定比例的 Query
-        if query_ratio < 1.0:
-            n_select = int(n_queries * query_ratio)
-            selected_queries = np.random.choice(n_queries, size=n_select, replace=False)
-            selected_queries.sort()
-        else:
-            selected_queries = np.arange(n_queries)
-
-        # 2. 负采样 (遍历选中的 Query，保证正样本全保留)
-        used_indices = []
-        for q in tqdm(selected_queries, desc="  Sampling rows", unit="query"):
-            start, end = splits[q], splits[q+1]
-            q_labels = labels[start:end]
-
-            # 正样本索引 (Label > 0)
-            pos_idx = np.where(q_labels > 0)[0] + start
-            # 负样本索引 (Label == 0)
-            neg_idx = np.where(q_labels == 0)[0] + start
-
-            if neg_ratio < 1.0 and len(neg_idx) > 0:
-                n_neg = int(len(neg_idx) * neg_ratio)
-                if n_neg > 0:
-                    neg_idx = np.random.choice(neg_idx, size=n_neg, replace=False)
-                else:
-                    neg_idx = np.array([], dtype=int)
-
-            used_indices.append(pos_idx)
-            if len(neg_idx) > 0:
-                used_indices.append(neg_idx)
-
-        if used_indices:
-            used_indices = np.concatenate(used_indices)
-            used_indices.sort()  # LightGBM subset 要求索引有序
-            # subset 会根据我们抽取的行，自动重新计算并设置 group
-            train_ds = train_ds.subset(used_indices).construct()
-            total_train = train_ds.num_data()
-            print(f"  => 采样完成! Sampled Train Dataset: {total_train:,} rows")
-        else:
-            raise ValueError("采样后没有任何样本留下，请检查采样比例参数！")
-
-    # 训练时用 train 自身监控，不用 val（避免 bin mapper 不一致问题）
-    # Recall@K 在 evaluate() 中单独计算
     params = {
         'objective': 'lambdarank',
         'metric': 'ndcg',
@@ -406,7 +317,6 @@ def train(train_bin_info, val_years, query_ratio=1.0, neg_ratio=1.0):
         'learning_rate': 0.03,
         'num_leaves': 127,
         'max_depth': 10,
-        'n_estimators': 2000,
         'num_threads': 16,
         'max_bin': 255,
         'feature_fraction': 0.7,
@@ -419,37 +329,112 @@ def train(train_bin_info, val_years, query_ratio=1.0, neg_ratio=1.0):
         'verbosity': -1,
     }
 
-    # 预估训练时间
-    n_estimators = 2000
-    print(f"  预估训练时间: ~{total_train/1000000*3:.0f}-{total_train/1000000*5:.0f}分钟 (基于{n_estimators}轮, lr=0.03)")
+    TOTAL_TREES = 2000
+    EPOCHS = 5  # 遍历所有年份的轮数（建议多轮，防止模型遗忘早年数据）
+    n_bins = len(train_bin_info)
 
-    ckpt_cb = CheckpointCallback(output_dir=MODEL_DIR, freq=20)
-    timing_cb = TimingCallback(freq=20, total_iters=n_estimators)
+    # 每次遇到一个年份，分配新增的树的数量
+    trees_per_step = max(1, TOTAL_TREES // (EPOCHS * n_bins))
 
-    model = lgb.train(
-        params, train_ds,
-        valid_sets=[train_ds], valid_names=['train'],
-        callbacks=[
-            lgb.log_evaluation(20),
-            ckpt_cb,
-            timing_cb,
-        ],
-    )
-
+    booster = None
     model_path = MODEL_DIR / "0322ltr_model.txt"
-    model.save_model(str(model_path))
-    print(f"\n  Model: {model_path}")
-    print(f"  Train time: {time.time()-t0:.1f}s")
+    ckpt_dir = MODEL_DIR / "checkpoints"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
 
+    current_tree_count = 0
+
+    for epoch in range(1, EPOCHS + 1):
+        print(f"\n>>> 开始 Epoch {epoch}/{EPOCHS} <<<")
+
+        # 每次打乱年份训练顺序，防止模型形成时间上的偏好依赖
+        import random
+        # random.shuffle(train_bin_info) # 如果你的业务强依赖时间顺序，请注释这一行，否则建议保留打乱
+
+        for i, (bin_path, _, _) in enumerate(train_bin_info):
+            # 获取文件名中的年份用于打印
+            year_match = re.search(r'train_(\d+)\.bin', str(bin_path))
+            year_str = year_match.group(1) if year_match else str(i)
+
+            print(f"  [Epoch {epoch} | 年份 {year_str}] 正在加载构建...")
+
+            # 1. 单独加载本年数据
+            train_ds = lgb.Dataset(str(bin_path))
+            train_ds.construct()
+
+            # 2. 本年数据局部动态采样（只算单年，极快，绝不会卡死）
+            if query_ratio < 1.0 or neg_ratio < 1.0:
+                labels = train_ds.get_label()
+                groups = train_ds.get_group()
+                splits = np.r_[0, np.cumsum(groups)]
+                n_queries = len(groups)
+
+                if query_ratio < 1.0:
+                    n_select = int(n_queries * query_ratio)
+                    selected_queries = np.random.choice(n_queries, size=n_select, replace=False)
+                    selected_queries.sort()
+                else:
+                    selected_queries = np.arange(n_queries)
+
+                used_indices = []
+                for q in selected_queries:
+                    start, end = splits[q], splits[q+1]
+                    q_labels = labels[start:end]
+
+                    pos_idx = np.where(q_labels > 0)[0] + start
+                    neg_idx = np.where(q_labels == 0)[0] + start
+
+                    if neg_ratio < 1.0 and len(neg_idx) > 0:
+                        n_neg = int(len(neg_idx) * neg_ratio)
+                        if n_neg > 0:
+                            neg_idx = np.random.choice(neg_idx, size=n_neg, replace=False)
+                        else:
+                            neg_idx = np.array([], dtype=int)
+
+                    used_indices.append(pos_idx)
+                    if len(neg_idx) > 0:
+                        used_indices.append(neg_idx)
+
+                if used_indices:
+                    used_indices = np.concatenate(used_indices)
+                    used_indices.sort()
+                    # subset 当年的数据并重构
+                    train_ds = train_ds.subset(used_indices).construct()
+
+            # 3. 开始/继续增量训练
+            print(f"    -> 训练中: 新增 {trees_per_step} 棵树 (累计 {current_tree_count + trees_per_step} / {TOTAL_TREES})")
+            booster = lgb.train(
+                params,
+                train_ds,
+                num_boost_round=trees_per_step,
+                init_model=booster,          # 核心：继承上一次/上一年的模型，实现接力训练
+                keep_training_booster=True,  # 保持训练状态
+            )
+            current_tree_count += trees_per_step
+
+            # 4. 立刻释放当年内存
+            del train_ds
+            gc.collect()
+
+        # 每跑完一个 Epoch（所有年份数据过一遍），存一个 checkpoint
+        ckpt_path = ckpt_dir / f"ltr_model_epoch_{epoch}_trees_{current_tree_count}.txt"
+        booster.save_model(str(ckpt_path))
+        print(f"  [Checkpoint] Epoch {epoch} 完成 -> 已保存 {ckpt_path.name}")
+
+    # 最终保存
+    booster.save_model(str(model_path))
+    print(f"\n  Model Saved: {model_path}")
+    print(f"  Train total time: {time.time()-t0:.1f}s")
+
+    # 打印特征重要性
     imp = pd.DataFrame({
-        'feature': model.feature_name(),
-        'importance': model.feature_importance('gain'),
+        'feature': booster.feature_name(),
+        'importance': booster.feature_importance('gain'),
     }).sort_values('importance', ascending=False)
     print(f"\nTop 10 Features:")
     for _, r in imp.head(10).iterrows():
         print(f"  {r['feature']}: {r['importance']:.0f}")
 
-    return model_path
+    return str(model_path)
 
 
 # ═══════════════════════════════════════════════════════════════
