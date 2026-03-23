@@ -335,7 +335,7 @@ def train(train_years):
     trees_per_step = max(1, TOTAL_TREES // n_years)
 
     booster = None
-    model_path = MODEL_DIR / "0322ltr_model.txt"
+    model_path = MODEL_DIR / "over-fit-latest.txt"
     ckpt_dir = MODEL_DIR / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
@@ -374,7 +374,7 @@ def train(train_years):
         del X, labels, qids, train_ds
         gc.collect()
 
-        booster.save_model(str(ckpt_dir / "ltr_model_latest.txt"))
+        booster.save_model(str(ckpt_dir / "over-fit-latest.txt"))
 
     booster.save_model(str(model_path))
     print(f"\n  Model Saved: {model_path}")
