@@ -136,11 +136,11 @@ def load_cache(year: int):
     return tensor, city_map, to_dict
 
 
-def build_year_data(year: int, sample_n: int = None, neg_sample_n: int = 200, seed: int = 42):
+def build_year_data(year: int, sample_n: int = None, neg_sample_n: int = None, seed: int = 42):
     """从 DB 加载 year 数据，返回 (X, labels, qids, n_queries)
 
     Args:
-        neg_sample_n: 每个 query 保留多少个负样本 (默认 200)。设为 None 则保留全部 (336)。
+        neg_sample_n: 每个 query 保留多少个负样本。设为 None 则保留全部（排除出发城市自身）。
     """
     t0 = time.time()
     top_cols = ', '.join([f'To_Top{i}' for i in range(1, 21)])
@@ -177,8 +177,8 @@ def build_year_data(year: int, sample_n: int = None, neg_sample_n: int = 200, se
     hous_i = RATIO_FEATS.index('housing_price_avg_ratio')
     edu_i = RATIO_FEATS.index('education_score_ratio')
 
-    # 预估行数：每 query 约 20 正 + neg_sample_n 负
-    avg_per_q = (20 + (neg_sample_n or 336))
+    # 预估行数：每 query 约 20 正 + neg 负
+    avg_per_q = (20 + (neg_sample_n or 294))
     est_total = n_q * avg_per_q
     X = np.empty((int(est_total * 1.1), len(FEATS)), dtype=np.float32)
     labels = np.empty(int(est_total * 1.1), dtype=np.int8)
@@ -198,12 +198,12 @@ def build_year_data(year: int, sample_n: int = None, neg_sample_n: int = 200, se
         if len(all_to) == 0:
             continue
 
-        if len(all_to) < 336:
-            all_to = np.pad(all_to, (0, 336 - len(all_to)), constant_values=fc)
-        else:
-            all_to = all_to[:336]
+        # 排除出发城市自身
+        all_to = all_to[all_to != fc]
+        if len(all_to) == 0:
+            continue
 
-        # 直接用 np.isin 向量化判断，提速 10 倍以上
+        # 直接用 np.isin 向量化判断
         lbl = np.isin(all_to, pos_cities[q]).astype(np.int8)
 
         pos_idx = np.where(lbl > 0)[0]
@@ -214,7 +214,7 @@ def build_year_data(year: int, sample_n: int = None, neg_sample_n: int = 200, se
             neg_keep = rng.choice(neg_idx, size=n_neg_keep, replace=False) if n_neg_keep > 0 else np.array([], dtype=np.int64)
             keep_idx = np.concatenate([pos_idx, neg_keep])
         else:
-            keep_idx = np.arange(336)
+            keep_idx = np.arange(len(all_to))
 
         keep_idx.sort()
         n_keep = len(keep_idx)
@@ -301,52 +301,38 @@ def build_bin(year: int, is_train: bool, sample_n: int = None, neg_sample_n: int
     del X, labels, qids; gc.collect()
     return bin_path, n_rows, n_q
 # ═══════════════════════════════════════════════════════════════
-# 训练 (全内存动态轮转接力 - 彻底修复 Group 死锁版)
+# 训练 (全量过拟合模式 - 最大化 NDCG@20)
 # ═══════════════════════════════════════════════════════════════
 
-def train(train_years, val_years, query_ratio=1.0, neg_ratio=1.0):
+def train(train_years):
     t0 = time.time()
-    print("\n=== Train (全内存动态轮转接力) ===")
-
-    print(f"\n[预加载] 正在构建全局验证集 (年份: {val_years[0]})...")
-    val_X, val_labels, val_qids, _ = build_year_data(val_years[0], sample_n=10000, neg_sample_n=None)
-    val_groups = np.diff(np.r_[0, np.where(np.diff(val_qids) != 0)[0] + 1, len(val_qids)])
-    
-    val_ds = lgb.Dataset(val_X, label=val_labels, feature_name=list(FEATS),
-                         categorical_feature=CATS, free_raw_data=False, # 保留 raw_data 用于对齐
-                         params={'max_bin': 255, 'num_threads': 16})
-    val_ds.set_group(val_groups)
-    val_ds.construct()
-    
-    del val_X, val_labels, val_qids; gc.collect()
-    print("  => 验证集就绪！")
+    n_years = len(train_years)
+    print(f"\n=== Train (全量过拟合模式, {n_years} 年) ===")
 
     params = {
         'objective': 'lambdarank',
         'metric': 'ndcg',
-        'ndcg_eval_at': [5, 10, 20, 40],
+        'ndcg_eval_at': [20],
         'lambdarank_truncation_level': 20,
         'label_gain': '0,1',
         'boosting_type': 'gbdt',
-        'learning_rate': 0.05,   # 把步子迈小一点，稳扎稳打
-        'num_leaves': 63,         # 把树的复杂度砍半，不让它记噪音
-        'max_depth': 7,           # 限制树的深度
-        'num_threads': 16,
+        'learning_rate': 0.1,
+        'num_leaves': 255,
+        'max_depth': -1,
+        'num_threads': 20,
         'max_bin': 255,
-        'feature_fraction': 0.7,
-        'bagging_fraction': 0.8,
-        'bagging_freq': 1,
+        'feature_fraction': 1.0,
+        'bagging_fraction': 1.0,
+        'bagging_freq': 0,
         'lambda_l1': 0.0,
-        'lambda_l2': 0.5,         # 加大正则化力度
-        'min_child_samples': 50,  # 提高叶子的样本门槛
+        'lambda_l2': 0.0,
+        'min_child_samples': 5,
         'force_col_wise': True,
         'verbosity': 1,
     }
 
-    TOTAL_TREES = 3000
-    EPOCHS = 5  
-    n_years = len(train_years)
-    trees_per_step = max(1, TOTAL_TREES // (EPOCHS * n_years))
+    TOTAL_TREES = 5000
+    trees_per_step = max(1, TOTAL_TREES // n_years)
 
     booster = None
     model_path = MODEL_DIR / "0322ltr_model.txt"
@@ -355,94 +341,44 @@ def train(train_years, val_years, query_ratio=1.0, neg_ratio=1.0):
 
     current_tree_count = 0
 
-    for epoch in range(1, EPOCHS + 1):
-        print(f"\n" + "="*40)
-        print(f">>> 开始 Epoch {epoch}/{EPOCHS} <<<")
-        print("="*40)
+    for i, year in enumerate(train_years):
+        print(f"\n{'='*40}")
+        print(f">>> [{i+1}/{n_years}] 年份 {year} <<<")
+        print(f"{'='*40}")
 
-        for year in train_years:
-            print(f"\n  [Epoch {epoch} | 年份 {year}] 正在动态生成 Numpy 数据...")
-            
-            t_build = time.time()
-            # 负样本降到 50，内存瞬间降到 6GB，告别 Swap 卡顿！
-            X, labels, qids, n_q = build_year_data(year, sample_n=None, neg_sample_n=50)
-            groups = np.diff(np.r_[0, np.where(np.diff(qids) != 0)[0] + 1, len(qids)])
-            
-            train_ds = lgb.Dataset(X, label=labels, feature_name=list(FEATS),
-                                   categorical_feature=CATS, free_raw_data=False,
-                                   params={'max_bin': 255, 'num_threads': 16},
-                                   reference=val_ds)
-            train_ds.set_group(groups)
-            train_ds.construct()
-            print(f"    -> 数据加载完成，耗时 {time.time()-t_build:.1f}s, 数据量: {len(X):,} 行")
+        t_build = time.time()
+        X, labels, qids, n_q = build_year_data(year, sample_n=None, neg_sample_n=None)
+        groups = np.diff(np.r_[0, np.where(np.diff(qids) != 0)[0] + 1, len(qids)])
 
-            # =======================================================
-            # 局部动态采样 (【修改点 2】修复 Group 丢失问题)
-            # =======================================================
-            if query_ratio < 1.0 or neg_ratio < 1.0:
-                labels_mem = train_ds.get_label()
-                groups_mem = train_ds.get_group()
-                splits = np.r_[0, np.cumsum(groups_mem)]
-                n_queries = len(groups_mem)
+        train_ds = lgb.Dataset(X, label=labels, feature_name=list(FEATS),
+                               categorical_feature=CATS, free_raw_data=False,
+                               params={'max_bin': 255, 'num_threads': 20})
+        train_ds.set_group(groups)
+        train_ds.construct()
+        print(f"  -> 数据就绪: {len(X):,} 行, {n_q:,} queries (耗时 {time.time()-t_build:.1f}s)")
 
-                if query_ratio < 1.0:
-                    selected_queries = np.random.choice(n_queries, size=int(n_queries * query_ratio), replace=False)
-                    selected_queries.sort()
-                else:
-                    selected_queries = np.arange(n_queries)
+        print(f"  -> 训练: +{trees_per_step} 棵树 (累计 {current_tree_count + trees_per_step}/{TOTAL_TREES})")
+        booster = lgb.train(
+            params,
+            train_ds,
+            num_boost_round=trees_per_step,
+            valid_sets=[train_ds],
+            valid_names=[f'train_{year}'],
+            callbacks=[lgb.log_evaluation(10)],
+            init_model=booster,
+            keep_training_booster=True,
+        )
+        current_tree_count += trees_per_step
 
-                used_indices = []
-                new_groups = []  # 核心：记录采样后的新 Group 大小
+        booster.free_dataset()
+        del X, labels, qids, train_ds
+        gc.collect()
 
-                for q in selected_queries:
-                    start, end = splits[q], splits[q+1]
-                    q_labels = labels_mem[start:end]
-                    pos_idx = np.where(q_labels > 0)[0] + start
-                    neg_idx = np.where(q_labels == 0)[0] + start
-
-                    if neg_ratio < 1.0 and len(neg_idx) > 0:
-                        n_neg = int(len(neg_idx) * neg_ratio)
-                        if n_neg > 0:
-                            neg_idx = np.random.choice(neg_idx, size=n_neg, replace=False)
-                        else:
-                            neg_idx = np.array([], dtype=int)
-
-                    n_keep = len(pos_idx) + len(neg_idx)
-                    if n_keep > 0:
-                        used_indices.append(pos_idx)
-                        if len(neg_idx) > 0:
-                            used_indices.append(neg_idx)
-                        new_groups.append(n_keep) # 存下当前 Query 剩下的行数
-
-                if used_indices:
-                    used_indices = np.concatenate(used_indices)
-                    used_indices.sort()
-                    train_ds = train_ds.subset(used_indices)
-                    train_ds.set_group(new_groups) # 核心：把新 Group 告诉 LightGBM
-                    train_ds.construct()
-
-            print(f"    -> 训练中: 新增 {trees_per_step} 棵树 (累计 {current_tree_count + trees_per_step} / {TOTAL_TREES})")
-            booster = lgb.train(
-                params,
-                train_ds,
-                num_boost_round=trees_per_step,
-                valid_sets=[train_ds, val_ds],           # 【修改点 3】同时监控 train 和 val
-                valid_names=[f'train_{year}', 'val_2019'], 
-                callbacks=[lgb.log_evaluation(5)],
-                init_model=booster,          
-                keep_training_booster=True,
-            )
-            current_tree_count += trees_per_step
-
-            booster.free_dataset() 
-            del X, labels, qids, train_ds
-            gc.collect()
-
-            ckpt_path = ckpt_dir / f"ltr_model_latest.txt"
-            booster.save_model(str(ckpt_path))
+        booster.save_model(str(ckpt_dir / "ltr_model_latest.txt"))
 
     booster.save_model(str(model_path))
     print(f"\n  Model Saved: {model_path}")
+    print(f"  Total trees: {current_tree_count}")
     print(f"  Train total time: {time.time()-t0:.1f}s")
 
     imp = pd.DataFrame({
@@ -505,18 +441,8 @@ def main():
     p = argparse.ArgumentParser(description="0322 LambdaRank Pipeline")
     p.add_argument("--step", type=str, default="train,eval",
                    help="步骤: train,eval 或 all")
-    p.add_argument("--train-years", type=int, nargs="+", default=list(range(2000, 2019)))
-    p.add_argument("--val-years", type=int, nargs="+", default=[2019])
-    p.add_argument("--eval-years", type=int, nargs="+", default=[2020])
-    p.add_argument("--sample", type=int, default=None)
-    p.add_argument("--val-sample", type=int, default=None)
-    p.add_argument("--neg-sample", type=str, default="336")
-
-    p.add_argument("--train-query-ratio", type=float, default=1.0,
-                   help="训练时抽取的 Query 比例, 0~1 (默认 1.0 全量)")
-    p.add_argument("--train-neg-ratio", type=float, default=1.0,
-                   help="训练时的负采样比例, 0~1 (默认 1.0 不过滤)")
-
+    p.add_argument("--train-years", type=int, nargs="+", default=list(range(2000, 2021)))
+    p.add_argument("--eval-years", type=int, nargs="+", default=[2019, 2020])
     p.add_argument("--eval-sample", type=int, default=5000)
     p.add_argument("--model", type=str, default=None)
     args = p.parse_args()
@@ -529,11 +455,7 @@ def main():
     # Step 1: Train
     if do_all or "train" in steps:
         print("\n### STEP: Train ###")
-        model_path = train(
-            args.train_years, args.val_years,
-            query_ratio=args.train_query_ratio,
-            neg_ratio=args.train_neg_ratio
-        )
+        model_path = train(args.train_years)
     else:
         model_path = args.model or str(MODEL_DIR / "0322ltr_model.txt")
 
