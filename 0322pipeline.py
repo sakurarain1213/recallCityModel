@@ -136,11 +136,14 @@ def load_cache(year: int):
     return tensor, city_map, to_dict
 
 
-def build_year_data(year: int, sample_n: int = None, neg_sample_n: int = None, seed: int = 42):
+def build_year_data(year: int, sample_n: int = None, sample_ratio: float = None, neg_sample_n: int = None, seed: int = 42):
     """从 DB 加载 year 数据，返回 (X, labels, qids, n_queries)
 
     Args:
-        neg_sample_n: 每个 query 保留多少个负样本。设为 None 则保留全部（排除出发城市自身）。
+        sample_n: 采样的 Query 数量（绝对值）
+        sample_ratio: 采样的 Query 比例（如 0.5 表示 50%）。优先级低于 sample_n
+        neg_sample_n: 每个 query 保留多少个负样本。设为 None 则保留全部（排除出发城市自身）
+        seed: 随机种子
     """
     t0 = time.time()
     top_cols = ', '.join([f'To_Top{i}' for i in range(1, 21)])
@@ -153,10 +156,16 @@ def build_year_data(year: int, sample_n: int = None, neg_sample_n: int = None, s
     n_q = len(df_raw)
     print(f"  DB loaded {n_q:,} Type_IDs ({time.time()-t0:.1f}s)")
 
+    # 根据 sample_ratio 计算 sample_n
+    if sample_n is None and sample_ratio is not None:
+        sample_n = int(n_q * sample_ratio)
+
     if sample_n and sample_n < n_q:
         idx = np.random.default_rng(seed).choice(n_q, size=sample_n, replace=False)
         df_raw = df_raw.iloc[idx].reset_index(drop=True)
         n_q = sample_n
+        ratio_str = f"{sample_ratio*100:.0f}%" if sample_ratio else f"{sample_n:,}"
+        print(f"  采样 {ratio_str} -> {n_q:,} Querys (seed={seed})")
 
     tensor, city_map, to_dict = load_cache(year)
     print(f"  Cache: {tensor.shape}")
@@ -301,13 +310,14 @@ def build_bin(year: int, is_train: bool, sample_n: int = None, neg_sample_n: int
     del X, labels, qids; gc.collect()
     return bin_path, n_rows, n_q
 # ═══════════════════════════════════════════════════════════════
-# 训练 (全量过拟合模式 - 最大化 NDCG@20)
+# 训练 (全量终极过拟合模式 - 全局轮转防遗忘，彻底修复内存爆炸)
 # ═══════════════════════════════════════════════════════════════
 
 def train(train_years):
     t0 = time.time()
     n_years = len(train_years)
-    print(f"\n=== Train (全量过拟合模式, {n_years} 年) ===")
+    EPOCHS = 5  # 全局遍历的轮数
+    print(f"\n=== Train (终极全局过拟合模式, {n_years} 年 × {EPOCHS} 轮全局循环) ===")
 
     params = {
         'objective': 'lambdarank',
@@ -316,23 +326,32 @@ def train(train_years):
         'lambdarank_truncation_level': 20,
         'label_gain': '0,1',
         'boosting_type': 'gbdt',
-        'learning_rate': 0.1,
-        'num_leaves': 255,
-        'max_depth': -1,
-        'num_threads': 20,
-        'max_bin': 255,
-        'feature_fraction': 1.0,
-        'bagging_fraction': 1.0,
-        'bagging_freq': 0,
-        'lambda_l1': 0.0,
-        'lambda_l2': 0.0,
-        'min_child_samples': 5,
+
+        # ⬇️ 提速点 1：步长调大，用更少的树走更远的路
+        'learning_rate': 0.15,
+
+        'num_leaves': 1023,
+
+        # ⬇️ 提速点 2：加上深度限制！防止某根树枝无限生长导致 CPU 算力黑洞
+        'max_depth': 12,
+
+        # ⬇️ 提速点 3：从 1 改成 10！找只有 1 个样本的切分点极度耗时，设为 10 依然能严重过拟合，但建树速度快数十倍
+        'min_child_samples': 10,
+
+        'feature_pre_filter': False,
+
+        'num_threads': 16,
+        'max_bin': 127,
+        'feature_fraction': 0.6,
+        'bagging_fraction': 0.5,
+        'bagging_freq': 1,
         'force_col_wise': True,
         'verbosity': 1,
     }
 
-    TOTAL_TREES = 5000
-    trees_per_step = max(1, TOTAL_TREES // n_years)
+    # ⬇️ 提速点 4：总树数降到 10000。配合 5 轮 Epoch，每次只建 95 棵巨树
+    TOTAL_TREES = 10000
+    trees_per_step = max(1, TOTAL_TREES // (n_years * EPOCHS))
 
     booster = None
     model_path = MODEL_DIR / "over-fit-latest.txt"
@@ -341,40 +360,79 @@ def train(train_years):
 
     current_tree_count = 0
 
-    for i, year in enumerate(train_years):
-        print(f"\n{'='*40}")
-        print(f">>> [{i+1}/{n_years}] 年份 {year} <<<")
-        print(f"{'='*40}")
+    # =================================================================
+    # 【神级优化】：预先构建"迷你"全局参考 Dataset，占用极小内存，永不释放
+    # =================================================================
+    print("\n[初始化] 正在构建全局迷你参考集 (提取 5000 样本以锁定特征分箱边界)...")
+    ref_X, ref_lbl, ref_qids, _ = build_year_data(train_years[0], sample_n=5000, neg_sample_n=None)
+    ref_groups = np.diff(np.r_[0, np.where(np.diff(ref_qids) != 0)[0] + 1, len(ref_qids)])
 
-        t_build = time.time()
-        X, labels, qids, n_q = build_year_data(year, sample_n=None, neg_sample_n=None)
-        groups = np.diff(np.r_[0, np.where(np.diff(qids) != 0)[0] + 1, len(qids)])
+    global_ref_ds = lgb.Dataset(ref_X, label=ref_lbl, feature_name=list(FEATS),
+                                categorical_feature=CATS, free_raw_data=True,
+                                params={'max_bin': 127, 'feature_pre_filter': False})  # Dataset必须带此参数
+    global_ref_ds.set_group(ref_groups)
+    global_ref_ds.construct()
 
-        train_ds = lgb.Dataset(X, label=labels, feature_name=list(FEATS),
-                               categorical_feature=CATS, free_raw_data=False,
-                               params={'max_bin': 255, 'num_threads': 20})
-        train_ds.set_group(groups)
-        train_ds.construct()
-        print(f"  -> 数据就绪: {len(X):,} 行, {n_q:,} queries (耗时 {time.time()-t_build:.1f}s)")
+    del ref_X, ref_lbl, ref_qids
+    gc.collect()
+    print("  -> 迷你参考集构建完成，内存已释放！\n")
 
-        print(f"  -> 训练: +{trees_per_step} 棵树 (累计 {current_tree_count + trees_per_step}/{TOTAL_TREES})")
-        booster = lgb.train(
-            params,
-            train_ds,
-            num_boost_round=trees_per_step,
-            valid_sets=[train_ds],
-            valid_names=[f'train_{year}'],
-            callbacks=[lgb.log_evaluation(10)],
-            init_model=booster,
-            keep_training_booster=True,
-        )
-        current_tree_count += trees_per_step
+    # =================================================================
+    # 核心训练循环
+    # =================================================================
+    for epoch in range(1, EPOCHS + 1):
+        print(f"\n" + "★"*50)
+        print(f"★★★ 开始全局 Epoch {epoch}/{EPOCHS} ★★★")
+        print("★"*50)
 
-        booster.free_dataset()
-        del X, labels, qids, train_ds
-        gc.collect()
+        for i, year in enumerate(train_years):
+            print(f"\n  [Epoch {epoch} | 年份 {year} ({i+1}/{n_years})] 正在加载数据...")
 
-        booster.save_model(str(ckpt_dir / "over-fit-latest.txt"))
+            t_build = time.time()
+            # 【极速模式】：每轮只随机看当年 50% 的 Query，不同轮次用不同 seed 保证随机性
+            # 这样每轮速度翻倍，但多轮 Epoch 累积后仍能覆盖全部数据
+            X, labels, qids, n_q = build_year_data(
+                year,
+                sample_ratio=0.5,
+                neg_sample_n=None,
+                seed=42 + epoch * 1000 + i  # 每轮每年不同的 seed
+            )
+            groups = np.diff(np.r_[0, np.where(np.diff(qids) != 0)[0] + 1, len(qids)])
+
+            # 构建当年 Dataset，挂载全局迷你参考集，并开启 free_raw_data 节约内存
+            train_ds = lgb.Dataset(X, label=labels, feature_name=list(FEATS),
+                                   categorical_feature=CATS, free_raw_data=False,
+                                   params={'max_bin': 127, 'num_threads': 16, 'feature_pre_filter': False,
+                                           'bin_construct_sample_cnt': 50000},  # 降低采样数加速分箱
+                                   reference=global_ref_ds)
+            train_ds.set_group(groups)
+            train_ds.construct()
+
+            print(f"    -> 数据就绪: {len(X):,} 行 (耗时 {time.time()-t_build:.1f}s)")
+            print(f"    -> 训练: +{trees_per_step} 棵树 (累计 {current_tree_count + trees_per_step}/{TOTAL_TREES})")
+
+            booster = lgb.train(
+                params,
+                train_ds,
+                num_boost_round=trees_per_step,
+                valid_sets=[train_ds],
+                valid_names=[f'train_{year}'],
+                callbacks=[lgb.log_evaluation(10)],
+                init_model=booster,
+                keep_training_booster=True,
+            )
+            current_tree_count += trees_per_step
+
+            # =================================================================
+            # 【内存救星】：训练完当年，立刻连根拔起销毁所有庞大变量，绝不留到下一年！
+            # =================================================================
+            booster.free_dataset()
+            del train_ds, X, labels, qids, groups
+            gc.collect()
+
+        # 每跑完一个完整的全局 Epoch，存一次模型
+        booster.save_model(str(ckpt_dir / f"over-fit-epoch{epoch}.txt"))
+        print(f"\n[OK] 全局 Epoch {epoch} 完成，检查点已保存。")
 
     booster.save_model(str(model_path))
     print(f"\n  Model Saved: {model_path}")
