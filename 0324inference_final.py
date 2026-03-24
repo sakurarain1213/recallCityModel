@@ -15,25 +15,56 @@ python 0324inference_final.py --start-year 2000 --end-year 2000
 LightGBM 多线程火力全开
 多年份并行推理
 
+0324初版
+[Env] Python: 3.11.14 (main, Dec  9 2025, 18:59:10) [MSC v.1944 64 bit (AMD64)]
+[Env] pandas: 3.0.0, numpy: 2.4.2, lightgbm: 4.6.0
+[Hardware] CPU: 28 核 | 内存: 31.7GB (可用: 15.5GB)
+[2000] 开始读取数据...
+[2000] 构建完毕: 354,000 个 Query, 候选行数 104,076,000 行
+[2000] 分批推理: 每批最多 1,000,000 行
+[2000] 进度: 50/295 城市 | 已处理 60,000 Query | 耗时 151.2s
+[Env] Python: 3.11.14 (main, Dec  9 2025, 18:59:10) [MSC v.1944 64 bit (AMD64)]
+[Env] pandas: 3.0.0, numpy: 2.4.2, lightgbm: 4.6.0
+[Hardware] CPU: 28 核 | 内存: 31.7GB (可用: 15.5GB)
+[2000] 开始读取数据...
+[Env] Python: 3.11.14 (main, Dec  9 2025, 18:59:10) [MSC v.1944 64 bit (AMD64)]
+[Env] pandas: 3.0.0, numpy: 2.4.2, lightgbm: 4.6.0
+[Hardware] CPU: 28 核 | 内存: 31.7GB (可用: 15.5GB)
+[Env] Python: 3.11.14 (main, Dec  9 2025, 18:59:10) [MSC v.1944 64 bit (AMD64)]
+[Env] Python: 3.11.14 (main, Dec  9 2025, 18:59:10) [MSC v.1944 64 bit (AMD64)]
+[Env] pandas: 3.0.0, numpy: 2.4.2, lightgbm: 4.6.0
+[Hardware] CPU: 28 核 | 内存: 31.7GB (可用: 15.5GB)
+[2000] 开始读取数据...
+[2000] 构建完毕: 354,000 个 Query, 候选行数 104,076,000 行
+[2000] 分批推理: 每批最多 1,000,000 行
+[2000] 进度: 50/295 城市 | 已处理 60,000 Query | 耗时 151.2s
+[2000] 进度: 100/295 城市 | 已处理 120,000 Query | 耗时 299.8s
+[2000] 进度: 150/295 城市 | 已处理 180,000 Query | 耗时 457.7s
+[2000] 进度: 200/295 城市 | 已处理 240,000 Query | 耗时 610.1s
+[2000] 进度: 250/295 城市 | 已处理 300,000 Query | 耗时 757.9s
+✅ [2000] 推理耗时: 895.3s | Mean Recall@20: 55.6832% (n=354000)
+ 🎯 全局统计评估完毕
+ 总 Query 数量: 354,000
+ 📈 最终全局 Mean Recall@20: 55.6832%
+
+
+
 python 0324inference_final.py --start-year 2000 --end-year 2020
+"""
+"""
+LambdaRank 本地敏捷推理脚本 - Windows 测试满血版
+新增功能:
+1. 灵活指定起止年份与抽样比例
+2. 彻底解除 Windows 下的 CPU 单核封印，释放全部算力
+3. 采用严谨的 295 标准城市池，精准构建 294 候选城市列表
+4. 采用 Mean Recall@20 聚合指标，公平评估每个 Query
 """
 
 import os
-# 🚨 多线程配置：根据场景动态设置
-# - 单年份 + 单进程：解除封印，让 LightGBM 多线程火力全开
-# - 多年份 + 多进程：保持封印，避免进程间抢占资源
-# 默认解除封印，在多进程场景下由子进程重新设置
-if 'INFERENCE_WORKER' not in os.environ:
-    # 主进程：解除封印，允许 LightGBM 多线程
-    pass  # 不设置任何限制
-else:
-    # 子进程：限制单线程，避免多进程抢占
-    os.environ['OMP_NUM_THREADS'] = '1'
-    os.environ['OMP_WAIT_POLICY'] = 'PASSIVE'
-    os.environ['OPENBLAS_NUM_THREADS'] = '1'
-    os.environ['MKL_NUM_THREADS'] = '1'
-    os.environ['VECLIB_MAXIMUM_THREADS'] = '1'
-    os.environ['NUMEXPR_NUM_THREADS'] = '1'
+# 🚨 Windows 本地测试：彻底屏蔽多线程封印！
+# 让 LightGBM 能够通过 num_threads 参数真正调用多核
+# os.environ['OMP_NUM_THREADS'] = '1'  
+# os.environ['OMP_WAIT_POLICY'] = 'PASSIVE'
 
 import re
 import json
@@ -79,7 +110,6 @@ PROJECT_ROOT = Path(__file__).parent.resolve()
 if os.name == 'nt':
     DB_PATH = Path("C:/Users/w1625/Desktop/local_migration_data.db")
     CACHE_DIR = Path("data/city_pair_cache")
-    # 更新为最新的 0324 模型
     MODEL_PATH = Path("C:/Users/w1625/Desktop/0324ltr_model_rapid.txt") 
 else:
     DB_PATH = PROJECT_ROOT / "data" / "local_migration_data.db"
@@ -216,7 +246,7 @@ class FastPredictor:
         pos_cities = df_gt[[f'To_Top{i}' for i in range(1, 21)]].map(parse_to_city).values
         type_ids = df_gt['Type_ID'].values.tolist()
         
-        # 🎲 1. 抽样 Query 逻辑 (sample-ratio)
+        # 🎲 1. 抽样 Query 逻辑
         n_queries = len(type_ids)
         if sample_ratio < 1.0:
             rng = np.random.default_rng(seed + year)
@@ -226,7 +256,10 @@ class FastPredictor:
             pos_cities = [pos_cities[i] for i in keep_indices]
 
         gt_dict = {tid: set(pos) for tid, pos in zip(type_ids, pos_cities)}
-        gt_from_cities = np.array(list(set(int(tid.rsplit('_', 1)[-1]) for tid in type_ids)), dtype=np.int32)
+        
+        # 🎯 核心更新：直接将 GT 中的出发城市集合定义为标准的 295 全局候选池
+        global_city_pool = np.array(list(set(int(tid.rsplit('_', 1)[-1]) for tid in df_gt['Type_ID'].values)), dtype=np.int32)
+        print(f"[{year}] 构建标准候选城市池: 共 {len(global_city_pool)} 个核心城市")
 
         fc_groups = defaultdict(list)
         for tid in type_ids:
@@ -236,37 +269,37 @@ class FastPredictor:
         # 🎲 2. 抽样 候选城市 逻辑 (city-ratio)
         cands_cache = {}
         for fc_int in fc_groups:
-            cands = to_dict.get(fc_int, np.array([], dtype=np.int32))
-            if len(cands) > 0:
-                cands = cands[cands != fc_int]
-                cands = cands[np.isin(cands, gt_from_cities)]
+            # 标准操作：从 295 候选池中剔除出发城市，得到精准的 294 个候选
+            cands = global_city_pool[global_city_pool != fc_int]
+            
+            # 为了安全起见，取交集确保 parquet 里确实有这 294 个城市的特征
+            reachable = to_dict.get(fc_int, np.array([], dtype=np.int32))
+            cands = cands[np.isin(cands, reachable)]
                 
-                # 执行候选城市比例截断
-                if city_ratio < 1.0:
-                    target_cands_n = max(20, int(len(cands) * city_ratio))
-                    if target_cands_n < len(cands):
-                        rng_city = np.random.default_rng(seed + fc_int)
-                        cands = rng_city.choice(cands, target_cands_n, replace=False)
+            # 执行候选城市比例截断
+            if city_ratio < 1.0 and len(cands) > 0:
+                target_cands_n = max(20, int(len(cands) * city_ratio))
+                if target_cands_n < len(cands):
+                    rng_city = np.random.default_rng(seed + fc_int)
+                    cands = rng_city.choice(cands, target_cands_n, replace=False)
                         
             cands_cache[fc_int] = cands
 
         total_rows = sum(len(cands_cache[fc]) * len(grp) for fc_groups, grp in fc_groups.items() for fc in [fc_groups])
-        print(f"[{year}] 构建完毕: {len(type_ids):,} 个 Query, 候选行数 {total_rows:,} 行")
+        print(f"[{year}] 数据构建完毕: 参与计算 {len(type_ids):,} 个 Query, 展开后共 {total_rows:,} 行")
 
         all_pred_tids = []
         all_pred_cities = []
         t0 = time.time()
 
         # 🚀 分批推理参数：根据可用内存自动计算批次大小
-        # 每行特征 63 * 4 bytes = 252 bytes，预留安全余量
         MAX_BATCH_ROWS = int(AVAIL_MEM_GB * 1024**3 * 0.2 / (FEATS_COUNT * 4))
-        MAX_BATCH_ROWS = max(5000, min(MAX_BATCH_ROWS, 1_000_000))  # 限制在 5千~100万
-        print(f"[{year}] 分批推理: 每批最多 {MAX_BATCH_ROWS:,} 行")
+        MAX_BATCH_ROWS = max(5000, min(MAX_BATCH_ROWS, 1_000_000))  
+        print(f"[{year}] 分批引擎启动: 每批最高运算 {MAX_BATCH_ROWS:,} 行, 并发线程数 {self.num_threads}")
 
         processed_fc = 0
         total_fc = len(fc_groups)
 
-        # 推理循环 - 按 from_city 分组处理
         for fc_int, group in fc_groups.items():
             cands = cands_cache[fc_int]
             if len(cands) == 0: continue
@@ -275,7 +308,6 @@ class FastPredictor:
             pf = tensor[city_map[fc_int], city_map[cands], :]
             persons = np.array([g[0] for g in group], dtype=np.float32)
 
-            # 🚀 分批处理：按 Query 分批，边推理边取 Top-K
             batch_size = max(1, MAX_BATCH_ROWS // C)
             all_top_idx = []
 
@@ -295,10 +327,10 @@ class FastPredictor:
                 X[:, :, 61] = persons[batch_start:batch_end, 1:2] * pf[np.newaxis, :, HOUS_I]
                 X[:, :, 62] = persons[batch_start:batch_end, 5:6] * pf[np.newaxis, :, EDU_I]
 
+                # 💡 推理时直接传递设定的线程数，充分调用 CPU 核心
                 scores_batch = self.model.predict(X.reshape(-1, FEATS_COUNT), num_threads=self.num_threads)
                 scores_2d = scores_batch.reshape(K_batch, C)
 
-                # 立即取 Top-K，不存储所有分数
                 if C > top_k:
                     top_idx = np.argpartition(-scores_2d, top_k, axis=1)[:, :top_k]
                     top_scores = np.take_along_axis(scores_2d, top_idx, axis=1)
@@ -308,13 +340,12 @@ class FastPredictor:
                     top_idx = np.argsort(-scores_2d, axis=1)
 
                 all_top_idx.append(top_idx)
-                del X, scores_batch, scores_2d  # 立即释放内存
+                del X, scores_batch, scores_2d 
 
-            # 合并所有批次的 Top-K 结果
             pred_cities = cands[np.vstack(all_top_idx)]
             all_pred_tids.extend([g[1] for g in group])
             all_pred_cities.extend(pred_cities.tolist())
-            del all_top_idx, pf, persons  # 释放内存
+            del all_top_idx, pf, persons 
 
             processed_fc += 1
             if processed_fc % 50 == 0:
@@ -323,79 +354,58 @@ class FastPredictor:
 
         infer_time = time.time() - t0
         
-        # 写入 JSONL
         with open(out_file, 'w', encoding='utf-8') as f:
             for tid, cities in zip(all_pred_tids, all_pred_cities):
                 f.write(json.dumps({tid: cities}) + '\n')
 
-        # 🎯 严谨的 Mean Recall@20 计算：每个 Query 算召回，再对所有 Query 取平均
+        # 🎯 采用公平准确的 Mean Recall@20：先算各个 Query，再求全局均值
         query_rates = []
         for i in range(len(all_pred_tids)):
             tid = all_pred_tids[i]
             true_set = gt_dict.get(tid, set())
             pred_set = set(all_pred_cities[i])
 
-            # 只有当该 Query 存在真实的 Ground Truth 目标时才计入统计
             if len(true_set) > 0:
                 hits = len(pred_set & true_set)
                 query_rates.append(hits / len(true_set))
 
         hit_rate = np.mean(query_rates) if query_rates else 0.0
 
-        # 兼容主函数统计，返回所有 query 召回率列表
-        print(f"✅ [{year}] 推理耗时: {infer_time:.1f}s | Mean Recall@20: {hit_rate:.4%} (n={len(query_rates)})")
+        print(f"✅ [{year}] 跑完啦！推理耗时: {infer_time:.1f}s | Mean Recall@20: {hit_rate:.4%} (有效验证集 N={len(query_rates):,})")
         return year, query_rates
 
 def process_year(year, model_path, db_path, cache_dir, num_threads, sample_ratio, city_ratio):
-    # 子进程标记：用于多进程场景下限制单线程
-    os.environ['INFERENCE_WORKER'] = '1'
     predictor = FastPredictor(model_path, db_path, cache_dir, num_threads)
     return predictor.run_year(year, top_k=20, sample_ratio=sample_ratio, city_ratio=city_ratio)
 
 def main():
-    # 🚀 自动设置 workers 和 threads
-    # 每个进程大约需要 3-4GB 内存（tensor + 特征矩阵）
-    mem_based_workers = max(1, int(AVAIL_MEM_GB / 4))
-    default_workers = min(CPU_COUNT, mem_based_workers, 16)  # 不超过 16 进程
-    default_threads = CPU_COUNT  # 默认使用全部核心
+    default_workers = 1 
+    default_threads = CPU_COUNT  # 默认调用 CPU 的全量核心参与树模型并行
 
     p = argparse.ArgumentParser()
-    p.add_argument("--workers", type=int, default=0, help=f"并行进程数 (默认: 自动检测={default_workers}, 设为 0 自动)")
-    p.add_argument("--threads", type=int, default=0, help=f"LightGBM 线程数 (默认: 自动检测={default_threads}, 设为 0 自动)")
+    p.add_argument("--workers", type=int, default=default_workers, help=f"并行进程数 (建议本地设为 1)")
+    p.add_argument("--threads", type=int, default=default_threads, help=f"LightGBM 调用的并行线程数 (默认本机满核 {CPU_COUNT})")
     p.add_argument("--start-year", type=int, default=2020)
     p.add_argument("--end-year", type=int, default=2020)
     p.add_argument("--sample-ratio", type=float, default=1.0, help="Query抽样比例 0-1 (默认 100%)")
     p.add_argument("--city-ratio", type=float, default=1.0, help="候选城市抽样比例 0-1 (默认 100%)")
     args = p.parse_args()
 
-    # 如果 workers=0，自动检测
-    workers = args.workers if args.workers > 0 else default_workers
-    # 如果 threads=0，自动检测
-    threads = args.threads if args.threads > 0 else default_threads
-
-    # 智能调整：如果多年份多进程，每个进程用较少线程避免抢占
-    years = list(range(args.start_year, args.end_year + 1))
-    if len(years) > 1 and workers > 1:
-        threads = max(1, CPU_COUNT // workers)
-        print(f"[Auto] 多年份多进程模式: {workers} 进程 × {threads} 线程/进程")
-    else:
-        print(f"[Auto] 单年份模式: 1 进程 × {threads} 线程 (LightGBM 多线程)")
-
-    # 1. 打印模型结构信息
     print_model_info(MODEL_PATH)
 
+    years = list(range(args.start_year, args.end_year + 1))
     model_path = ensure_binary_model(MODEL_PATH)
 
     print(f"\n{'='*60}")
-    print(f" 🚀 本地敏捷启动: {years[0]}-{years[-1]} ({len(years)} 年)")
-    print(f" ⚙️  参数配置: Query 取 {args.sample_ratio:.1%} | 城市 取 {args.city_ratio:.1%} | {workers} 进程 × {threads} 线程")
+    print(f" 🚀 本地强力起飞: {years[0]}-{years[-1]} ({len(years)} 年)")
+    print(f" ⚙️  参数策略: Query 取 {args.sample_ratio:.1%} | 候选城市取 {args.city_ratio:.1%} (基于标准 294 池)")
+    print(f" 🏎️  算力配置: {args.workers} 个进程分配任务 | LightGBM 使用 {args.threads} 线程运算")
     print(f"{'='*60}\n")
 
     all_query_rates = []
 
-    # 本地运行多进程
-    with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
-        futures = {executor.submit(process_year, y, model_path, DB_PATH, CACHE_DIR, threads, args.sample_ratio, args.city_ratio): y for y in years}
+    with concurrent.futures.ProcessPoolExecutor(max_workers=args.workers) as executor:
+        futures = {executor.submit(process_year, y, model_path, DB_PATH, CACHE_DIR, args.threads, args.sample_ratio, args.city_ratio): y for y in years}
         for future in concurrent.futures.as_completed(futures):
             try:
                 year, query_rates = future.result()
@@ -403,16 +413,15 @@ def main():
             except Exception as e:
                 print(f" ❌ 错误: {e}")
 
-    # 打印最终聚合指标：所有 Query 召回率的均值
     if all_query_rates:
         global_mean_recall = np.mean(all_query_rates)
         print(f"\n{'='*60}")
-        print(f" 🎯 全局统计评估完毕")
-        print(f" 总 Query 数量: {len(all_query_rates):,}")
-        print(f" 📈 最终全局 Mean Recall@20: {global_mean_recall:.4%}")
+        print(f" 🎯 任务圆满结束: 指标统计聚合完毕")
+        print(f" 📋 有效参与评估的 Query 总数: {len(all_query_rates):,}")
+        print(f" 📈 最终大盘综合 Mean Recall@20: {global_mean_recall:.4%}")
         print(f"{'='*60}\n")
     else:
-        print("未进行评估或抽样数据为空。")
+        print("抽样数据为空或缺乏Ground Truth，未进行指标评估。")
 
 if __name__ == '__main__':
     multiprocessing.set_start_method('spawn', force=True) 
