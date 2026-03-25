@@ -2,13 +2,13 @@
 LambdaRank Pipeline (敏捷验证 & 全局大盘版)
 
 Usage 快速验证模式 (每半年抽100个训练, 20个验证):
-  uv run 0322pipeline.py --step train --train-n 100 --val-n 20
+  uv run 0325pipeline.py --step train --train-n 100 --val-n 20
 
 Usage 放大规模模式 (每年抽5万个训练, 2千个验证) 约1h :
-uv run 0322pipeline.py --step train --train-n 50000 --val-n 2000 --train-neg 100
-uv run 0322pipeline.py --step train --train-n 50000 --val-n 2000 --train-neg 100 --val-neg -1 --num-rounds 3000 --save-every 50
+uv run 0325pipeline.py --step train --train-n 50000 --val-n 2000 --train-neg 100
+uv run 0325pipeline.py --step train --train-n 50000 --val-n 2000 --train-neg 100 --val-neg -1 --num-rounds 3000 --save-every 50
 
-uv run 0322pipeline.py --step train --train-n 150000 --val-n 10000 --train-neg -1 --val-neg -1 --num-rounds 3000 --save-every 100
+uv run 0325pipeline.py --step train --train-n 150000 --val-n 10000 --train-neg -1 --val-neg -1 --num-rounds 3000 --save-every 100
 """
 
 import gc
