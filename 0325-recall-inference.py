@@ -1,18 +1,9 @@
 """
 0325 Binary Classification 本地敏捷推理脚本 - Windows 测试满血版
-新增功能:
-1. 适配 0325 Binary 二分类模型输出 (Probability Ranking)
-2. 灵活指定起止年份与抽样比例
-3. 解除 Windows 下的 CPU 单核封印，释放全部算力
-4. 采用严谨的 295 标准城市池，精准构建 294 候选城市列表
+(基于 337 全局城市池架构修正)
 """
 
 import os
-# 🚨 Windows 本地测试：彻底屏蔽多线程封印！
-# 让 LightGBM 能够通过 num_threads 参数真正调用多核
-# os.environ['OMP_NUM_THREADS'] = '1'  
-# os.environ['OMP_WAIT_POLICY'] = 'PASSIVE'
-
 import re
 import json
 import time
@@ -36,7 +27,6 @@ import psutil
 # 自动硬件检测
 # ═══════════════════════════════════════════════════════════════
 def detect_hardware():
-    """自动检测 CPU 核心数和可用内存"""
     cpu_count = multiprocessing.cpu_count()
     mem_gb = psutil.virtual_memory().total / (1024**3)
     avail_mem_gb = psutil.virtual_memory().available / (1024**3)
@@ -56,13 +46,13 @@ PROJECT_ROOT = Path(__file__).parent.resolve()
 if os.name == 'nt':
     DB_PATH = Path("C:/Users/w1625/Desktop/local_migration_data.db")
     CACHE_DIR = Path("data/city_pair_cache")
-    # 0325 更新：指向本地的 recall_model_round_600.txt
     MODEL_PATH = Path("C:/Users/w1625/Desktop/recall_model_round_600.txt") 
+    CITY_NODES_PATH = Path("data/city_nodes.jsonl") # ✅ 新增
 else:
     DB_PATH = PROJECT_ROOT / "data" / "local_migration_data.db"
     CACHE_DIR = PROJECT_ROOT / "data" / "city_pair_cache"
-    # 0325 更新：服务器路径先留空，你需要时替换
     MODEL_PATH = PROJECT_ROOT / "TODO_SERVER_PATH" / "model_round_600.txt"
+    CITY_NODES_PATH = PROJECT_ROOT / "data" / "city_nodes.jsonl" # ✅ 新增
 
 MODEL_BIN_PATH = MODEL_PATH.with_suffix('.mcl')
 OUTPUT_DIR = Path("recall_result")
@@ -71,21 +61,8 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 # ═══════════════════════════════════════════════════════════════
 # 特征定义
 # ═══════════════════════════════════════════════════════════════
-RATIO_FEATS = [
-    'gdp_per_capita_ratio', 'cpi_index_ratio', 'unemployment_rate_ratio',
-    'agri_share_ratio', 'agri_wage_ratio', 'agri_vacancy_ratio',
-    'mfg_share_ratio', 'mfg_wage_ratio', 'mfg_vacancy_ratio',
-    'trad_svc_share_ratio', 'trad_svc_wage_ratio', 'trad_svc_vacancy_ratio',
-    'mod_svc_share_ratio', 'mod_svc_wage_ratio', 'mod_svc_vacancy_ratio',
-    'housing_price_avg_ratio', 'rent_avg_ratio', 'daily_cost_index_ratio',
-    'medical_score_ratio', 'education_score_ratio', 'transport_convenience_ratio',
-    'avg_commute_mins_ratio', 'population_total_ratio',
-    'age_0_17_ratio', 'age_18_34_ratio', 'age_35_54_ratio',
-    'age_55_64_ratio', 'age_65_plus_ratio', 'sex_ratio_ratio', 'area_sqkm_ratio',
-]
-DIFF_FEATS = ['gdp_per_capita_diff', 'housing_price_avg_diff', 'rent_avg_diff',
-              'agri_wage_diff', 'mfg_wage_diff', 'trad_svc_wage_diff', 'mod_svc_wage_diff',
-              'agri_vacancy_diff', 'mfg_vacancy_diff', 'trad_svc_vacancy_diff', 'mod_svc_vacancy_diff']
+RATIO_FEATS = ['gdp_per_capita_ratio', 'cpi_index_ratio', 'unemployment_rate_ratio', 'agri_share_ratio', 'agri_wage_ratio', 'agri_vacancy_ratio', 'mfg_share_ratio', 'mfg_wage_ratio', 'mfg_vacancy_ratio', 'trad_svc_share_ratio', 'trad_svc_wage_ratio', 'trad_svc_vacancy_ratio', 'mod_svc_share_ratio', 'mod_svc_wage_ratio', 'mod_svc_vacancy_ratio', 'housing_price_avg_ratio', 'rent_avg_ratio', 'daily_cost_index_ratio', 'medical_score_ratio', 'education_score_ratio', 'transport_convenience_ratio', 'avg_commute_mins_ratio', 'population_total_ratio', 'age_0_17_ratio', 'age_18_34_ratio', 'age_35_54_ratio', 'age_55_64_ratio', 'age_65_plus_ratio', 'sex_ratio_ratio', 'area_sqkm_ratio']
+DIFF_FEATS = ['gdp_per_capita_diff', 'housing_price_avg_diff', 'rent_avg_diff', 'agri_wage_diff', 'mfg_wage_diff', 'trad_svc_wage_diff', 'mod_svc_wage_diff', 'agri_vacancy_diff', 'mfg_vacancy_diff', 'trad_svc_vacancy_diff', 'mod_svc_vacancy_diff']
 ABS_FEATS = ['to_tier', 'to_population_log', 'to_gdp_per_capita', 'from_tier', 'from_population_log', 'tier_diff']
 NET_DIST_FEATS = ['migrant_stock_from_to', 'geo_distance', 'dialect_distance', 'is_same_province']
 CACHE_FEAT_COLS = RATIO_FEATS + DIFF_FEATS + ABS_FEATS + NET_DIST_FEATS
@@ -130,11 +107,9 @@ def ensure_binary_model(model_path: Path) -> Path:
     return bin_path
 
 def print_model_info(model_path: Path):
-    """打印二分类模型结构和参数特征"""
     print(f"\n{'='*60}")
     print(f" 📊 二分类模型预检: {model_path.name}")
     print(f"{'='*60}")
-    
     if not model_path.exists():
         print("❌ 找不到模型文件！请检查路径。")
         sys.exit(1)
@@ -152,6 +127,17 @@ def print_model_info(model_path: Path):
     for idx, r in imp.head(15).iterrows():
         print(f"    {int(idx)+1:2d}. {r['feature']:<25}: {r['importance']:,.0f}")
     print(f"{'='*60}\n")
+
+# ✅ 新增：加载 337 个全局城市节点
+def load_global_cities(path: Path) -> np.ndarray:
+    cities = []
+    if not path.exists():
+        raise FileNotFoundError(f"找不到城市节点文件: {path}")
+    with open(path, 'r', encoding='utf-8') as f:
+        for line in f:
+            if line.strip():
+                cities.append(int(json.loads(line)['city_id']))
+    return np.array(cities, dtype=np.int32)
 
 # ═══════════════════════════════════════════════════════════════
 # 推理引擎
@@ -177,16 +163,17 @@ class FastPredictor:
         v_feats = df[CACHE_FEAT_COLS].values.astype(np.float32)
         np.nan_to_num(v_feats, copy=False, nan=0.0)
         tensor[city_map[df['from_city'].values], city_map[df['to_city'].values]] = v_feats
-        to_dict = df.groupby('from_city')['to_city'].apply(lambda x: x.values.astype(np.int32)).to_dict()
-        return tensor, city_map, to_dict
+        
+        # 返回 all_ids 提供安全的索引范围
+        return tensor, city_map, all_ids
 
     def run_year(self, year, top_k_list=[20, 30, 40, 50, 60, 70, 80, 90, 100], sample_ratio=1.0, city_ratio=1.0, seed=42):
-        out_file = OUTPUT_DIR / f"{year}_local_sample.jsonl"  # 恢复 JSONL 输出
+        out_file = OUTPUT_DIR / f"{year}_local_sample.jsonl"
 
-        max_top_k = max(top_k_list)  # 需要推理的最大 K 值
+        max_top_k = max(top_k_list) 
 
         print(f"[{year}] 开始读取数据...")
-        tensor, city_map, to_dict = self.load_data(year)
+        tensor, city_map, valid_ids = self.load_data(year)
 
         conn = duckdb.connect(str(self.db_path), read_only=True)
         top_cols = ', '.join([f'To_Top{i}' for i in range(1, 21)])
@@ -196,7 +183,6 @@ class FastPredictor:
         pos_cities = df_gt[[f'To_Top{i}' for i in range(1, 21)]].map(parse_to_city).values
         type_ids = df_gt['Type_ID'].values.tolist()
 
-        # 🎲 抽样逻辑
         n_queries = len(type_ids)
         if sample_ratio < 1.0:
             rng = np.random.default_rng(seed + year)
@@ -207,8 +193,8 @@ class FastPredictor:
 
         gt_dict = {tid: set(pos) for tid, pos in zip(type_ids, pos_cities)}
 
-        # 🎯 核心更新：直接将 GT 中的出发城市集合定义为标准的 295 全局候选池
-        global_city_pool = np.array(list(set(int(tid.rsplit('_', 1)[-1]) for tid in df_gt['Type_ID'].values)), dtype=np.int32)
+        # ✅ 核心更新：使用 337 个全局城市节点作为候选池！
+        global_city_pool = load_global_cities(CITY_NODES_PATH)
         print(f"[{year}] 构建标准候选城市池: 共 {len(global_city_pool)} 个核心城市")
 
         fc_groups = defaultdict(list)
@@ -216,17 +202,13 @@ class FastPredictor:
             person, fc_int, full_tid = parse_single_type_id(tid)
             fc_groups[fc_int].append((person, full_tid))
 
-        # 🎲 2. 抽样 候选城市 逻辑 (city-ratio)
         cands_cache = {}
         for fc_int in fc_groups:
-            # 标准操作：从 295 候选池中剔除出发城市，得到精准的 294 个候选
+            # 去除出发地
             cands = global_city_pool[global_city_pool != fc_int]
-            
-            # 为了安全起见，取交集确保 parquet 里确实有这 294 个城市的特征
-            reachable = to_dict.get(fc_int, np.array([], dtype=np.int32))
-            cands = cands[np.isin(cands, reachable)]
+            # 安全锁：确保候选城市在 parquet 的城市列表中，防止越界
+            cands = np.intersect1d(cands, valid_ids)
                 
-            # 执行候选城市比例截断
             if city_ratio < 1.0 and len(cands) > 0:
                 target_cands_n = max(20, int(len(cands) * city_ratio))
                 if target_cands_n < len(cands):
@@ -242,7 +224,6 @@ class FastPredictor:
         all_pred_cities = []
         t0 = time.time()
 
-        # 🚀 分批推理参数：根据可用内存自动计算批次大小
         MAX_BATCH_ROWS = int(AVAIL_MEM_GB * 1024**3 * 0.2 / (FEATS_COUNT * 4))
         MAX_BATCH_ROWS = max(5000, min(MAX_BATCH_ROWS, 1_000_000))  
         print(f"[{year}] 分批引擎启动: 每批最高运算 {MAX_BATCH_ROWS:,} 行, 并发线程数 {self.num_threads}")
@@ -277,7 +258,6 @@ class FastPredictor:
                 X[:, :, 61] = persons[batch_start:batch_end, 1:2] * pf[np.newaxis, :, HOUS_I]
                 X[:, :, 62] = persons[batch_start:batch_end, 5:6] * pf[np.newaxis, :, EDU_I]
 
-                # 💡 二分类预测：输出的是 0~1 的概率，按照概率倒序排列选 Top K
                 scores_batch = self.model.predict(X.reshape(-1, FEATS_COUNT), num_threads=self.num_threads)
                 scores_2d = scores_batch.reshape(K_batch, C)
 
@@ -292,7 +272,7 @@ class FastPredictor:
                 all_top_idx.append(top_idx)
                 del X, scores_batch, scores_2d
 
-            pred_cities = cands[np.vstack(all_top_idx)]  # shape: (K, max_top_k)
+            pred_cities = cands[np.vstack(all_top_idx)]
             all_pred_tids.extend([g[1] for g in group])
             all_pred_cities.extend(pred_cities.tolist())
             del all_top_idx, pf, persons
@@ -304,35 +284,30 @@ class FastPredictor:
 
         infer_time = time.time() - t0
 
-        # ✅ 恢复 JSONL 输出：保存前 100 个 top recall 结果
         with open(out_file, 'w', encoding='utf-8') as f:
             for tid, cities in zip(all_pred_tids, all_pred_cities):
                 f.write(json.dumps({tid: cities[:100]}) + '\n')
         print(f"[{year}] 已保存推理结果到: {out_file}")
 
-        # 🎯 多指标评估: Hit20@30, Hit20@40, Hit20@50, Hit20@60
-        # 计算每个 K 值下的命中率 (预测的 K 个中命中实际 20 个正样本的数量)
         metrics = {k: [] for k in top_k_list}
         for i in range(len(all_pred_tids)):
             tid = all_pred_tids[i]
             true_set = gt_dict.get(tid, set())
             if len(true_set) == 0:
                 continue
-            pred_cities_k = all_pred_cities[i]  # 已排序的 Top max_top_k 城市
+            pred_cities_k = all_pred_cities[i]
             for k in top_k_list:
                 pred_set_k = set(pred_cities_k[:k])
                 hits = len(pred_set_k & true_set)
-                metrics[k].append(hits)  # 记录命中数量 (0~20)
+                metrics[k].append(hits)
 
-        # 计算各指标的均值
         results = {}
         for k in top_k_list:
             if metrics[k]:
-                results[k] = np.mean(metrics[k])  # Mean Hit 数量
+                results[k] = np.mean(metrics[k])
             else:
                 results[k] = 0.0
 
-        # 打印结果
         metrics_str = ' | '.join([f"Hit20@{k}: {results[k]:.2f}" for k in top_k_list])
         print(f"✅ [{year}] 推理耗时: {infer_time:.1f}s | {metrics_str} (N={len(all_pred_tids):,})")
         return year, results, len(all_pred_tids)
@@ -343,16 +318,16 @@ def process_year(year, model_path, db_path, cache_dir, num_threads, sample_ratio
 
 def main():
     default_workers = 1
-    default_threads = CPU_COUNT  # 默认调用 CPU 的全量核心参与树模型并行
+    default_threads = CPU_COUNT
     TOP_K_LIST = [20, 30, 40, 50, 60, 70, 80, 90, 100]
 
     p = argparse.ArgumentParser()
     p.add_argument("--workers", type=int, default=default_workers, help=f"并行进程数 (建议本地设为 1)")
-    p.add_argument("--threads", type=int, default=default_threads, help=f"LightGBM 调用的并行线程数 (默认本机满核 {CPU_COUNT})")
+    p.add_argument("--threads", type=int, default=default_threads, help=f"LightGBM 调用的并行线程数")
     p.add_argument("--start-year", type=int, default=2000)
     p.add_argument("--end-year", type=int, default=2020)
-    p.add_argument("--sample-ratio", type=float, default=1.0, help="Query抽样比例 0-1 (默认 100%)")
-    p.add_argument("--city-ratio", type=float, default=1.0, help="候选城市抽样比例 0-1 (默认 100%)")
+    p.add_argument("--sample-ratio", type=float, default=1.0, help="Query抽样比例 0-1")
+    p.add_argument("--city-ratio", type=float, default=1.0, help="候选城市抽样比例 0-1")
     args = p.parse_args()
 
     print_model_info(MODEL_PATH)
@@ -362,12 +337,11 @@ def main():
 
     print(f"\n{'='*60}")
     print(f" 🚀 Binary 本地强力起飞: {years[0]}-{years[-1]} ({len(years)} 年)")
-    print(f" ⚙️  参数策略: Query 取 {args.sample_ratio:.1%} | 候选城市取 {args.city_ratio:.1%} (基于标准 294 池)")
+    print(f" ⚙️  参数策略: Query 取 {args.sample_ratio:.1%} | 候选池使用 337 全局城市")
     print(f" 📊 评估指标: Hit20@{TOP_K_LIST}")
     print(f" 🏎️  算力配置: LightGBM 使用 {args.threads} 线程运算")
     print(f"{'='*60}\n")
 
-    # 汇总所有年份的结果
     all_results = {k: [] for k in TOP_K_LIST}
     total_queries = 0
 
@@ -382,16 +356,14 @@ def main():
             city_ratio=args.city_ratio
         )
 
-        # 打印该年度前 20 命中率 (Hit20@100 中前 20 的命中率)
-        hit20_at_100 = results[100]  # 这是前 100 个预测中命中 GT 20 个的平均数量
-        hit_rate_20_in_100 = hit20_at_100 / 20.0 * 100  # 转换为百分比
+        hit20_at_100 = results[100]
+        hit_rate_20_in_100 = hit20_at_100 / 20.0 * 100
         print(f"📊 [{year}] 前100结果中命中前20的命中率: {hit_rate_20_in_100:.1f}% (平均命中 {hit20_at_100:.2f}/20)")
 
         for k in all_results:
             all_results[k].append(results[k])
         total_queries += n_queries
 
-    # 最终汇总
     print(f"\n{'='*60}")
     print(f" 🎯 二分类召回任务圆满结束: 指标统计聚合完毕")
     print(f" 📋 有效参与评估的 Query 总数: {total_queries:,}")

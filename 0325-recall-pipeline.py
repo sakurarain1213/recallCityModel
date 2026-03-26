@@ -1,18 +1,20 @@
 """
-LambdaRank Pipeline (敏捷验证 & 全局大盘版)
+LambdaRank Pipeline (敏捷验证 & 全局大盘版 - 337 全局城市池修正版)
 
 Usage 快速验证模式 (每半年抽100个训练, 20个验证):
-  uv run 0325pipeline.py --step train --train-n 100 --val-n 20
+  uv run 0325-recall-pipeline.py --step train --train-n 100 --val-n 20
 
 Usage 放大规模模式 (每年抽5万个训练, 2千个验证) 约1h :
-uv run 0325pipeline.py --step train --train-n 50000 --val-n 2000 --train-neg 100
-uv run 0325pipeline.py --step train --train-n 50000 --val-n 2000 --train-neg 100 --val-neg -1 --num-rounds 3000 --save-every 50
+uv run 0325-recall-pipeline.py --step train --train-n 50000 --val-n 2000 --train-neg 100
+uv run 0325-recall-pipeline.py --step train --train-n 50000 --val-n 2000 --train-neg 100 --val-neg -1 --num-rounds 3000 --save-every 50
 
-uv run 0325pipeline.py --step train --train-n 150000 --val-n 10000 --train-neg -1 --val-neg -1 --num-rounds 3000 --save-every 100
+
+python 0325-recall-pipeline.py --step train --train-n 50000 --val-n 1000 --train-neg -1 --val-neg -1 --num-rounds 6000 --save-every 100
 """
 
 import gc
 import re
+import json
 import time
 import argparse
 from pathlib import Path
@@ -27,14 +29,18 @@ from tqdm import tqdm
 # 路径配置
 # ═══════════════════════════════════════════════════════════════
 import os as _os
+PROJECT_ROOT = Path(__file__).parent.resolve()
+
 if _os.name == 'nt':
     DB_PATH = Path("C:/Users/w1625/Desktop/local_migration_data.db")
     CACHE_DIR = Path("data/city_pair_cache")
     MODEL_DIR = Path("output/models")
+    CITY_NODES_PATH = Path("data/city_nodes.jsonl") # ✅ 新增全局城市池路径
 else:
-    DB_PATH = Path("/data1/wxj/Recall_city_project/data/local_migration_data.db")
-    CACHE_DIR = Path("/data1/wxj/Recall_city_project/data/city_pair_cache")
-    MODEL_DIR = Path("/data1/wxj/Recall_city_project/output/models")
+    DB_PATH = Path("/home/lpg/code/recall-train/data/local_migration_data.db")
+    CACHE_DIR = Path("/home/lpg/code/recall-train/data/city_pair_cache")
+    MODEL_DIR = Path("/home/lpg/code/recall-train/output/models")
+    CITY_NODES_PATH = Path("/home/lpg/code/recall-train/data/city_nodes.jsonl") # ✅ 新增全局城市池路径
 
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -42,37 +48,17 @@ MODEL_DIR.mkdir(parents=True, exist_ok=True)
 # 特征定义
 # ═══════════════════════════════════════════════════════════════
 PERSON_CATS = ['gender', 'age_group', 'education', 'industry', 'income', 'family']
-RATIO_FEATS = [
-    'gdp_per_capita_ratio', 'cpi_index_ratio', 'unemployment_rate_ratio',
-    'agri_share_ratio', 'agri_wage_ratio', 'agri_vacancy_ratio',
-    'mfg_share_ratio', 'mfg_wage_ratio', 'mfg_vacancy_ratio',
-    'trad_svc_share_ratio', 'trad_svc_wage_ratio', 'trad_svc_vacancy_ratio',
-    'mod_svc_share_ratio', 'mod_svc_wage_ratio', 'mod_svc_vacancy_ratio',
-    'housing_price_avg_ratio', 'rent_avg_ratio', 'daily_cost_index_ratio',
-    'medical_score_ratio', 'education_score_ratio', 'transport_convenience_ratio',
-    'avg_commute_mins_ratio', 'population_total_ratio',
-    'age_0_17_ratio', 'age_18_34_ratio', 'age_35_54_ratio',
-    'age_55_64_ratio', 'age_65_plus_ratio', 'sex_ratio_ratio', 'area_sqkm_ratio',
-]
-DIFF_FEATS = [
-    'gdp_per_capita_diff', 'housing_price_avg_diff', 'rent_avg_diff',
-    'agri_wage_diff', 'mfg_wage_diff', 'trad_svc_wage_diff', 'mod_svc_wage_diff',
-    'agri_vacancy_diff', 'mfg_vacancy_diff', 'trad_svc_vacancy_diff', 'mod_svc_vacancy_diff',
-]
+RATIO_FEATS = ['gdp_per_capita_ratio', 'cpi_index_ratio', 'unemployment_rate_ratio', 'agri_share_ratio', 'agri_wage_ratio', 'agri_vacancy_ratio', 'mfg_share_ratio', 'mfg_wage_ratio', 'mfg_vacancy_ratio', 'trad_svc_share_ratio', 'trad_svc_wage_ratio', 'trad_svc_vacancy_ratio', 'mod_svc_share_ratio', 'mod_svc_wage_ratio', 'mod_svc_vacancy_ratio', 'housing_price_avg_ratio', 'rent_avg_ratio', 'daily_cost_index_ratio', 'medical_score_ratio', 'education_score_ratio', 'transport_convenience_ratio', 'avg_commute_mins_ratio', 'population_total_ratio', 'age_0_17_ratio', 'age_18_34_ratio', 'age_35_54_ratio', 'age_55_64_ratio', 'age_65_plus_ratio', 'sex_ratio_ratio', 'area_sqkm_ratio']
+DIFF_FEATS = ['gdp_per_capita_diff', 'housing_price_avg_diff', 'rent_avg_diff', 'agri_wage_diff', 'mfg_wage_diff', 'trad_svc_wage_diff', 'mod_svc_wage_diff', 'agri_vacancy_diff', 'mfg_vacancy_diff', 'trad_svc_vacancy_diff', 'mod_svc_vacancy_diff']
 ABS_FEATS = ['to_tier', 'to_population_log', 'to_gdp_per_capita', 'from_tier', 'from_population_log', 'tier_diff']
 NET_DIST_FEATS = ['migrant_stock_from_to', 'geo_distance', 'dialect_distance', 'is_same_province']
-CROSS_FEATS = [
-    'industry_x_matched_wage_ratio', 'industry_x_matched_vacancy_ratio',
-    'education_x_tier_diff', 'income_x_gdp_ratio',
-    'age_x_housing_ratio', 'family_x_edu_score_ratio',
-]
+CROSS_FEATS = ['industry_x_matched_wage_ratio', 'industry_x_matched_vacancy_ratio', 'education_x_tier_diff', 'income_x_gdp_ratio', 'age_x_housing_ratio', 'family_x_edu_score_ratio']
 CATS = PERSON_CATS + ['is_same_province', 'to_tier', 'from_tier']
 FEATS = PERSON_CATS + RATIO_FEATS + DIFF_FEATS + ABS_FEATS + NET_DIST_FEATS + CROSS_FEATS
 CACHE_FEAT_COLS = RATIO_FEATS + DIFF_FEATS + ABS_FEATS + NET_DIST_FEATS
 
 FEATS_COUNT = len(FEATS)
 
-# TypeID 解析映射
 AGE_MAP = {'20': 0, '30': 1, '40': 2, '55': 3, '65': 4}
 EDU_MAP = {'EduLo': 0, 'EduMid': 1, 'EduHi': 2}
 IND_MAP = {'Agri': 0, 'Mfg': 1, 'Service': 2, 'Wht': 3}
@@ -80,7 +66,6 @@ INC_MAP = {'IncL': 0, 'IncML': 1, 'IncM': 2, 'IncMH': 3, 'IncH': 4}
 FAM_MAP = {'Split': 0, 'Unit': 1}
 GENDER_MAP = {'M': 0, 'F': 1}
 
-# 交叉特征列索引预计算
 wage_i = [RATIO_FEATS.index(c) for c in ['agri_wage_ratio', 'mfg_wage_ratio', 'trad_svc_wage_ratio', 'mod_svc_wage_ratio']]
 vac_i = [RATIO_FEATS.index(c) for c in ['agri_vacancy_ratio', 'mfg_vacancy_ratio', 'trad_svc_vacancy_ratio', 'mod_svc_vacancy_ratio']]
 tier_i = len(RATIO_FEATS) + ABS_FEATS.index('tier_diff')
@@ -100,10 +85,25 @@ def parse_to_city(s: str) -> int:
     m = re.search(r'\((\d+)\)', s)
     return int(m.group(1)) if m else int(s)
 
+# ✅ 新增：加载 337 个全局城市节点
+def load_global_cities(path: Path) -> np.ndarray:
+    cities = []
+    if not path.exists():
+        raise FileNotFoundError(f"找不到城市节点文件: {path}")
+    with open(path, 'r', encoding='utf-8') as f:
+        for line in f:
+            if line.strip():
+                cities.append(int(json.loads(line)['city_id']))
+    return np.array(cities, dtype=np.int32)
 
 def load_cache(year: int):
     path = CACHE_DIR / f"city_pairs_{year}.parquet"
-    df = pd.read_parquet(path, columns=['from_city', 'to_city'] + CACHE_FEAT_COLS)
+    
+    # ✅ 改用 duckdb 极速读取，规避 pyarrow 报错
+    cols_str = ', '.join(['from_city', 'to_city'] + CACHE_FEAT_COLS)
+    df = duckdb.query(f"SELECT {cols_str} FROM '{path}'").to_df()
+    
+    # 提取 parquet 中实际拥有特征的合法城市 ID，用作后期的安全过滤
     all_ids = np.unique(np.concatenate([df['from_city'].values, df['to_city'].values]))
     max_id = int(all_ids.max())
     city_map = np.zeros(max_id + 1, dtype=np.int32)
@@ -114,11 +114,11 @@ def load_cache(year: int):
     np.nan_to_num(valid_features, copy=False, nan=0.0)
     tensor[city_map[df['from_city'].values], city_map[df['to_city'].values]] = valid_features
 
-    to_dict = df.groupby('from_city')['to_city'].apply(lambda x: x.values.astype(np.int32)).to_dict()
-    return tensor, city_map, to_dict
+    # 返回 all_ids 替代原本的 to_dict
+    return tensor, city_map, all_ids
 
 
-def _extract_features(df_subset, tensor, city_map, to_dict, neg_sample_n=None, seed=42):
+def _extract_features(df_subset, tensor, city_map, valid_ids, global_city_pool, neg_sample_n=None, seed=42):
     """将拆分好的小批量 DataFrame 转换为 X, labels, qids"""
     if len(df_subset) == 0:
         return np.empty((0, FEATS_COUNT), dtype=np.float32), np.empty(0, dtype=np.int8), np.empty(0, dtype=np.int32), 0
@@ -130,7 +130,8 @@ def _extract_features(df_subset, tensor, city_map, to_dict, neg_sample_n=None, s
     from_cities = np.array([parse_type_id(t)[6] for t in type_ids], dtype=np.int32)
 
     n_q = len(type_ids)
-    est_total = n_q * (20 + (neg_sample_n or 294))
+    # 因为现在的负样本池固定在 336 左右，所以可以直接预估容量
+    est_total = n_q * (20 + (neg_sample_n or len(global_city_pool)))
     X = np.empty((int(est_total * 1.2), FEATS_COUNT), dtype=np.float32)
     labels = np.empty(int(est_total * 1.2), dtype=np.int8)
     qids = np.empty(int(est_total * 1.2), dtype=np.int32)
@@ -141,10 +142,12 @@ def _extract_features(df_subset, tensor, city_map, to_dict, neg_sample_n=None, s
 
     for q in range(n_q):
         fc = from_cities[q]
-        all_to = to_dict.get(fc, np.array([], dtype=np.int32))
-        if len(all_to) == 0: continue
         
-        all_to = all_to[all_to != fc]
+        # ✅ 核心修正：候选池直接等于 337 全局池 排除 出发地自身
+        all_to = global_city_pool[global_city_pool != fc]
+        # 加上一道安全锁：只保留在 parquet 里存在特征的城市，防止数组越界
+        all_to = np.intersect1d(all_to, valid_ids)
+
         if len(all_to) == 0: continue
 
         lbl = np.isin(all_to, pos_cities[q]).astype(np.int8)
@@ -186,12 +189,6 @@ def _extract_features(df_subset, tensor, city_map, to_dict, neg_sample_n=None, s
 
 
 def build_year_train_val_data(year: int, train_n: int, val_n: int, train_neg: int, val_neg: int, seed: int = 42):
-    """加载该年份的数据，在保证互斥的情况下，拆分出极小的 Train 和 Val 集合
-
-    Args:
-        train_neg: 训练集每个Query的负样本数 (最多274个，因为总共294城-20正样本)
-        val_neg: 验证集每个Query的负样本数
-    """
     top_cols = ', '.join([f'To_Top{i}' for i in range(1, 21)])
     sql = f"SELECT Type_ID, {top_cols} FROM migration_data WHERE Year = {year}"
 
@@ -201,11 +198,9 @@ def build_year_train_val_data(year: int, train_n: int, val_n: int, train_neg: in
 
     total_q = len(df_raw)
     
-    # 确保想要采样的总数不超过数据库的总行数
     actual_train_n = min(train_n, total_q)
     actual_val_n = min(val_n, total_q - actual_train_n)
 
-    # 全局打乱并拆分索引，保证 Train 和 Val 绝对不重合！
     rng = np.random.default_rng(seed)
     shuffled_idx = rng.permutation(total_q)
     
@@ -215,22 +210,22 @@ def build_year_train_val_data(year: int, train_n: int, val_n: int, train_neg: in
     df_train = df_raw.iloc[train_idx].reset_index(drop=True)
     df_val = df_raw.iloc[val_idx].reset_index(drop=True)
 
-    # 加载底层缓存
-    tensor, city_map, to_dict = load_cache(year)
+    # ✅ 加载全局的 337 个城市池
+    global_city_pool = load_global_cities(CITY_NODES_PATH)
+
+    # 返回有效城市的 IDs
+    tensor, city_map, valid_ids = load_cache(year)
 
     train_neg_str = "全部" if train_neg is None else train_neg
     val_neg_str = "全部" if val_neg is None else val_neg
     print(f"  [处理 {year}] 抽取 Train={len(df_train):,} (neg={train_neg_str}) / Val={len(df_val):,} (neg={val_neg_str})...")
-    tr_X, tr_y, tr_q, tr_nq = _extract_features(df_train, tensor, city_map, to_dict, neg_sample_n=train_neg, seed=seed)
-    vl_X, vl_y, vl_q, vl_nq = _extract_features(df_val, tensor, city_map, to_dict, neg_sample_n=val_neg, seed=seed+1)
+    
+    # 传入 valid_ids 和 global_city_pool
+    tr_X, tr_y, tr_q, tr_nq = _extract_features(df_train, tensor, city_map, valid_ids, global_city_pool, neg_sample_n=train_neg, seed=seed)
+    vl_X, vl_y, vl_q, vl_nq = _extract_features(df_val, tensor, city_map, valid_ids, global_city_pool, neg_sample_n=val_neg, seed=seed+1)
 
-    del tensor, city_map, to_dict; gc.collect()
+    del tensor, city_map, valid_ids, global_city_pool; gc.collect()
     return (tr_X, tr_y, tr_q, tr_nq), (vl_X, vl_y, vl_q, vl_nq)
-
-
-# ═══════════════════════════════════════════════════════════════
-# Checkpoint Callback
-# ═══════════════════════════════════════════════════════════════
 
 class CheckpointCallback:
     def __init__(self, output_dir, freq=50):
@@ -244,16 +239,10 @@ class CheckpointCallback:
             env.model.save_model(str(ckpt))
 
 
-# ═══════════════════════════════════════════════════════════════
-# 敏捷全局训练
-# ═══════════════════════════════════════════════════════════════
-
 def train_rapid_global(train_years, train_n, val_n, train_neg, val_neg, num_rounds=2000, save_every=100):
     t0 = time.time()
-    # 转换 -1 为 None（表示全部）
     if train_neg is not None and train_neg < 0: train_neg = None
     if val_neg is not None and val_neg < 0: val_neg = None
-    # 显示实际使用的负样本数
     train_neg_str = "全部" if train_neg is None else train_neg
     val_neg_str = "全部" if val_neg is None else val_neg
     print(f"\n=== 🚀 Train (敏捷全局混合模式 | 每年 Train:{train_n}(neg={train_neg_str}), Val:{val_n}(neg={val_neg_str})) ===")
@@ -262,15 +251,12 @@ def train_rapid_global(train_years, train_n, val_n, train_neg, val_neg, num_roun
     tr_X_list, tr_y_list = [], []
     vl_X_list, vl_y_list = [], []
 
-    # 1. 遍历收集所有年份的极小样本
     for year in train_years:
         (tr_X, tr_y, _, _), (vl_X, vl_y, _, _) = build_year_train_val_data(year, train_n, val_n, train_neg, val_neg)
 
-        # Binary 模式不需要 Query ID，直接收集 X 和 y
         tr_X_list.append(tr_X); tr_y_list.append(tr_y)
         vl_X_list.append(vl_X); vl_y_list.append(vl_y)
 
-    # 2. 全局无缝合并 (Binary 模式不需要 q_train 和 q_val)
     print("\n  [合并] 正在拼接全局大盘数据 (Binary 模式)...")
     X_train = np.vstack(tr_X_list)
     y_train = np.concatenate(tr_y_list)
@@ -281,55 +267,46 @@ def train_rapid_global(train_years, train_n, val_n, train_neg, val_neg, num_roun
 
     print(f"  [就绪] 全局 Train 矩阵: {X_train.shape} | 全局 Val 矩阵: {X_val.shape}")
 
-    # 计算正负样本不平衡比例，用于拉高 Recall
     pos_count = np.sum(y_train > 0)
     neg_count = len(y_train) - pos_count
     pos_weight = float(neg_count) / max(1.0, pos_count)
     print(f"  [平衡] 自动计算正样本权重 scale_pos_weight: {pos_weight:.2f}")
 
-    # 3. 构造 LightGBM Dataset (Binary 模式不需要 set_group)
-    train_ds = lgb.Dataset(X_train, label=y_train, feature_name=list(FEATS),
-                           categorical_feature=CATS, free_raw_data=True)
-    val_ds = lgb.Dataset(X_val, label=y_val, feature_name=list(FEATS),
-                         categorical_feature=CATS, free_raw_data=True,
-                         reference=train_ds)
+    train_ds = lgb.Dataset(X_train, label=y_train, feature_name=list(FEATS), categorical_feature=CATS, free_raw_data=True)
+    val_ds = lgb.Dataset(X_val, label=y_val, feature_name=list(FEATS), categorical_feature=CATS, free_raw_data=True, reference=train_ds)
 
     del X_train, y_train, X_val, y_val; gc.collect()
 
-    # 4. 训练核心配置 (绝对过拟合 & Recall 优先版)
     params = {
-        'objective': 'binary',          # 核心改变：回归纯粹的二分类
-        'metric': 'auc',                # 评估指标用 AUC
-        'scale_pos_weight': pos_weight, # 魔法参数：强迫模型宁可错杀一千，绝不放过一个正样本
+        'objective': 'binary',
+        'metric': 'auc',
+        'scale_pos_weight': pos_weight,
         'boosting_type': 'gbdt',
 
-        # 🚀 过拟合火力全开设定
-        'learning_rate': 0.1,          # 稍微降一点步长，让树长得更密
-        'num_leaves': 511,              # 极大幅度提升叶子节点 (原63)，允许模型死记硬背特征组合
-        'max_depth': -1,                # 不限制深度，向下无限扎根
-        'min_child_samples': 5,         # 极度降低叶子节点门槛，哪怕只有5个人有奇特癖好也给他们建个叶子
+        'learning_rate': 0.1,
+        'num_leaves': 511,
+        'max_depth': 12,
+        'min_child_samples': 500,
 
-        # 🛡️ 关闭一切防过拟合的阻碍
-        'bagging_fraction': 1.0,
-        'feature_fraction': 1.0,
+        'bagging_fraction': 0.8,
+        'bagging_freq': 1,
+        'feature_fraction': 0.8,
         'min_split_gain': 0.0,
 
-        # 硬件与系统
         'feature_pre_filter': False,
-        'num_threads': 40,              # 直接吃满 40 核
-        'max_bin': 255,
+        'num_threads': 40,
+        'max_bin': 63,
         'force_col_wise': True,
         'verbosity': 1,
     }
 
-    print("\n  [开训] 启动全量负样本的二分类过拟合训练...")
+    print("\n  [开训] 启动基于 337 全局城市池的二分类过拟合训练...")
 
     callbacks = [
         lgb.log_evaluation(50),
-        lgb.early_stopping(100)         # 容忍度放宽到 100 轮
+        lgb.early_stopping(100)
     ]
 
-    # 添加 checkpoint 回调
     if save_every > 0:
         ckpt_cb = CheckpointCallback(MODEL_DIR / "0325ltr_checkpoint", freq=save_every)
         callbacks.append(ckpt_cb)
@@ -337,8 +314,8 @@ def train_rapid_global(train_years, train_n, val_n, train_neg, val_neg, num_roun
     booster = lgb.train(
         params,
         train_ds,
-        num_boost_round=num_rounds,   # 最大允许树的数量
-        valid_sets=[train_ds, val_ds],  # 同时监控 Train 和 Val
+        num_boost_round=num_rounds,
+        valid_sets=[train_ds, val_ds],
         valid_names=['train', 'valid'],
         callbacks=callbacks
     )
@@ -347,30 +324,19 @@ def train_rapid_global(train_years, train_n, val_n, train_neg, val_neg, num_roun
     booster.save_model(str(model_path))
     print(f"\n[OK] 训练完成！模型已保存: {model_path} (耗时: {time.time()-t0:.1f}s)")
 
-    imp = pd.DataFrame({
-        'feature': booster.feature_name(),
-        'importance': booster.feature_importance('gain'),
-    }).sort_values('importance', ascending=False)
-    print(f"\nTop 10 核心特征:")
-    for _, r in imp.head(10).iterrows():
-        print(f"  {r['feature']}: {r['importance']:.0f}")
-
     return str(model_path)
 
 
-# ═══════════════════════════════════════════════════════════════
-# main 
-# ═══════════════════════════════════════════════════════════════
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--step", type=str, default="train")
     p.add_argument("--train-years", type=int, nargs="+", default=list(range(2000, 2021)))
-    p.add_argument("--train-n", type=int, default=100, help="每年抽取的训练 Query 数")
-    p.add_argument("--val-n", type=int, default=20, help="每年抽取的验证 Query 数")
-    p.add_argument("--train-neg", type=int, default=-1, help="训练集每个Query的负样本数 (-1=全部，默认全部)")
-    p.add_argument("--val-neg", type=int, default=-1, help="验证集每个Query的负样本数 (-1=全部，默认全部)")
-    p.add_argument("--num-rounds", type=int, default=2000, help="最大迭代轮次 (默认2000)")
-    p.add_argument("--save-every", type=int, default=100, help="每N轮保存一次checkpoint (默认100，0表示不保存)")
+    p.add_argument("--train-n", type=int, default=100)
+    p.add_argument("--val-n", type=int, default=20)
+    p.add_argument("--train-neg", type=int, default=-1)
+    p.add_argument("--val-neg", type=int, default=-1)
+    p.add_argument("--num-rounds", type=int, default=2000)
+    p.add_argument("--save-every", type=int, default=100)
     args = p.parse_args()
 
     steps = [s.strip() for s in args.step.split(",")]
