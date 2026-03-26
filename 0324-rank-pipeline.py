@@ -340,7 +340,7 @@ def train_rapid_global(train_years, train_n, val_n, num_rounds=2000, save_every=
         'label_gain': ','.join([str(i) for i in range(21)]), 
         'boosting_type': 'gbdt',
 
-        'learning_rate': 0.05,          
+        'learning_rate': 0.1,          
         'num_leaves': 127,             
         'max_depth': 8,                 
         'min_child_samples': 20,       

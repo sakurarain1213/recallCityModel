@@ -4,6 +4,12 @@
 1. Recall 阶段: 二分类模型对 294 城市打分，截取 Top 80。
 2. Rank 阶段: LambdaRank 模型直接在内存中接管这 80 个城市精准打分，选出最终 Top 20。
 3. 评测比对: 打印 Recall@20、Recall@80 和 最终 Rank@20 的平均命中个数。
+
+✅ [2000] 级联推理完成！耗时: 264.4s | 评估数量 N=35,400
+  [对照组] 纯 Recall 模型直接选 Top20 的平均命中: 12.18
+  [天花板] Recall 模型送给 Rank 的 Top80 的平均命中: 18.91
+  [最终版] Recall(80) + Rank(20) 精排后的平均命中: 12.71
+  [扩展版] Recall(80) + Rank(40) 精排后的平均命中: 16.14  🚀🚀🚀
 """
 
 import os
@@ -47,7 +53,7 @@ if os.name == 'nt':
     CACHE_DIR = Path("data/city_pair_cache")
     # 记得将这里的路径替换成你实际跑出来的模型！
     MODEL_RECALL_PATH = Path("C:/Users/w1625/Desktop/recall_model_round_600.txt") 
-    MODEL_RANK_PATH = Path("C:/Users/w1625/Desktop/0326ltr_model_rank.txt")
+    MODEL_RANK_PATH = Path("C:/Users/w1625/Desktop/rank_model_round_6000.txt")
 else:
     DB_PATH = PROJECT_ROOT / "data" / "local_migration_data.db"
     CACHE_DIR = PROJECT_ROOT / "data" / "city_pair_cache"
@@ -155,7 +161,7 @@ class CascadePredictor:
             cands_cache[fc_int] = cands
 
         t0 = time.time()
-        all_pred_recall_20, all_pred_recall_80, all_pred_final_20, all_tids = [], [], [], []
+        all_pred_recall_20, all_pred_recall_80, all_pred_final_20, all_pred_final_40, all_tids = [], [], [], [], []
 
         MAX_BATCH_ROWS = int(AVAIL_MEM_GB * 1024**3 * 0.2 / (FEATS_COUNT * 4))
         MAX_BATCH_ROWS = max(5000, min(MAX_BATCH_ROWS, 1_000_000))  
@@ -206,8 +212,11 @@ class CascadePredictor:
 
                 scores_rank = self.model_rank.predict(X_rank.reshape(-1, FEATS_COUNT), num_threads=self.num_threads).reshape(K_batch, actual_recall_k)
 
+                actual_rank_40 = min(C, 40)
                 top20_rank_rel_idx = np.argpartition(-scores_rank, actual_rank_k - 1, axis=1)[:, :actual_rank_k]
+                top40_rank_rel_idx = np.argpartition(-scores_rank, actual_rank_40 - 1, axis=1)[:, :actual_rank_40]
                 top20_final_idx = np.take_along_axis(top80_idx, top20_rank_rel_idx, axis=1)
+                top40_final_idx = np.take_along_axis(top80_idx, top40_rank_rel_idx, axis=1)
 
                 # =========================================================
                 # 归档结果
@@ -215,13 +224,14 @@ class CascadePredictor:
                 all_pred_recall_20.extend(cands[top20_recall_idx].tolist())
                 all_pred_recall_80.extend(cands[top80_idx].tolist())
                 all_pred_final_20.extend(cands[top20_final_idx].tolist())
+                all_pred_final_40.extend(cands[top40_final_idx].tolist())
                 all_tids.extend([g[1] for g in group[batch_start:batch_end]])
                 
                 del X, X_rank, scores_recall, scores_rank
 
         infer_time = time.time() - t0
 
-        hits_recall_20, hits_recall_80, hits_final_20 = [], [], []
+        hits_recall_20, hits_recall_80, hits_final_20, hits_final_40 = [], [], [], []
 
         for i in range(len(all_tids)):
             tid = all_tids[i]
@@ -231,17 +241,20 @@ class CascadePredictor:
             hits_recall_20.append(len(set(all_pred_recall_20[i]) & true_set))
             hits_recall_80.append(len(set(all_pred_recall_80[i]) & true_set))
             hits_final_20.append(len(set(all_pred_final_20[i]) & true_set))
+            hits_final_40.append(len(set(all_pred_final_40[i]) & true_set))
 
         mean_rec20 = np.mean(hits_recall_20) if hits_recall_20 else 0.0
         mean_rec80 = np.mean(hits_recall_80) if hits_recall_80 else 0.0
         mean_fin20 = np.mean(hits_final_20) if hits_final_20 else 0.0
+        mean_fin40 = np.mean(hits_final_40) if hits_final_40 else 0.0
 
         print(f"\n✅ [{year}] 级联推理完成！耗时: {infer_time:.1f}s | 评估数量 N={len(hits_recall_20):,}")
         print(f"  [对照组] 纯 Recall 模型直接选 Top20 的平均命中: {mean_rec20:.2f}")
         print(f"  [天花板] Recall 模型送给 Rank 的 Top80 的平均命中: {mean_rec80:.2f}")
-        print(f"  [最终版] Recall(80) + Rank(20) 精排后的平均命中: {mean_fin20:.2f}  🚀🚀🚀")
+        print(f"  [最终版] Recall(80) + Rank(20) 精排后的平均命中: {mean_fin20:.2f}")
+        print(f"  [扩展版] Recall(80) + Rank(40) 精排后的平均命中: {mean_fin40:.2f}  🚀🚀🚀")
 
-        return year, mean_rec20, mean_rec80, mean_fin20
+        return year, mean_rec20, mean_rec80, mean_fin20, mean_fin40
 
 def main():
     p = argparse.ArgumentParser()
