@@ -46,12 +46,12 @@ PROJECT_ROOT = Path(__file__).parent.resolve()
 if os.name == 'nt':
     DB_PATH = Path("C:/Users/w1625/Desktop/local_migration_data.db")
     CACHE_DIR = Path("data/city_pair_cache")
-    MODEL_PATH = Path("C:/Users/w1625/Desktop/recall_model_round_600.txt") 
+    MODEL_PATH = Path("C:/Users/w1625/Desktop/recall_model_0329.txt") 
     CITY_NODES_PATH = Path("data/city_nodes.jsonl") # ✅ 新增
 else:
     DB_PATH = PROJECT_ROOT / "data" / "local_migration_data.db"
     CACHE_DIR = PROJECT_ROOT / "data" / "city_pair_cache"
-    MODEL_PATH = PROJECT_ROOT / "TODO_SERVER_PATH" / "model_round_600.txt"
+    MODEL_PATH = PROJECT_ROOT / "output" / "models" / "0325ltr_model_rapid.txt"
     CITY_NODES_PATH = PROJECT_ROOT / "data" / "city_nodes.jsonl" # ✅ 新增
 
 MODEL_BIN_PATH = MODEL_PATH.with_suffix('.mcl')
@@ -192,6 +192,7 @@ class FastPredictor:
             pos_cities = [pos_cities[i] for i in keep_indices]
 
         gt_dict = {tid: set(pos) for tid, pos in zip(type_ids, pos_cities)}
+        gt_dict_top5 = {tid: set(pos[:5]) for tid, pos in zip(type_ids, pos_cities)}
 
         # ✅ 核心更新：使用 337 个全局城市节点作为候选池！
         global_city_pool = load_global_cities(CITY_NODES_PATH)
@@ -225,7 +226,7 @@ class FastPredictor:
         t0 = time.time()
 
         MAX_BATCH_ROWS = int(AVAIL_MEM_GB * 1024**3 * 0.2 / (FEATS_COUNT * 4))
-        MAX_BATCH_ROWS = max(5000, min(MAX_BATCH_ROWS, 1_000_000))  
+        MAX_BATCH_ROWS = max(5000, min(MAX_BATCH_ROWS, 10_000_000))
         print(f"[{year}] 分批引擎启动: 每批最高运算 {MAX_BATCH_ROWS:,} 行, 并发线程数 {self.num_threads}")
 
         processed_fc = 0
@@ -258,7 +259,11 @@ class FastPredictor:
                 X[:, :, 61] = persons[batch_start:batch_end, 1:2] * pf[np.newaxis, :, HOUS_I]
                 X[:, :, 62] = persons[batch_start:batch_end, 5:6] * pf[np.newaxis, :, EDU_I]
 
-                scores_batch = self.model.predict(X.reshape(-1, FEATS_COUNT), num_threads=self.num_threads)
+                scores_batch = self.model.predict(
+                    X.reshape(-1, FEATS_COUNT),
+                    num_threads=self.num_threads,
+                    num_iteration=800
+                )
                 scores_2d = scores_batch.reshape(K_batch, C)
 
                 if C > max_top_k:
@@ -289,26 +294,28 @@ class FastPredictor:
                 f.write(json.dumps({tid: cities[:100]}) + '\n')
         print(f"[{year}] 已保存推理结果到: {out_file}")
 
-        metrics = {k: [] for k in top_k_list}
+        metrics_hit5 = {k: [] for k in top_k_list}
+        metrics_hit20 = {k: [] for k in top_k_list}
         for i in range(len(all_pred_tids)):
             tid = all_pred_tids[i]
             true_set = gt_dict.get(tid, set())
             if len(true_set) == 0:
                 continue
+            true_top5 = gt_dict_top5.get(tid, set())
             pred_cities_k = all_pred_cities[i]
             for k in top_k_list:
                 pred_set_k = set(pred_cities_k[:k])
-                hits = len(pred_set_k & true_set)
-                metrics[k].append(hits)
+                metrics_hit5[k].append(len(pred_set_k & true_top5))
+                metrics_hit20[k].append(len(pred_set_k & true_set))
 
         results = {}
         for k in top_k_list:
-            if metrics[k]:
-                results[k] = np.mean(metrics[k])
-            else:
-                results[k] = 0.0
+            results[k] = {
+                'hit5': np.mean(metrics_hit5[k]) if metrics_hit5[k] else 0.0,
+                'hit20': np.mean(metrics_hit20[k]) if metrics_hit20[k] else 0.0,
+            }
 
-        metrics_str = ' | '.join([f"Hit20@{k}: {results[k]:.2f}" for k in top_k_list])
+        metrics_str = ' | '.join([f"@{k}: H5={results[k]['hit5']:.2f} H20={results[k]['hit20']:.2f}" for k in top_k_list])
         print(f"✅ [{year}] 推理耗时: {infer_time:.1f}s | {metrics_str} (N={len(all_pred_tids):,})")
         return year, results, len(all_pred_tids)
 
@@ -318,7 +325,7 @@ def process_year(year, model_path, db_path, cache_dir, num_threads, sample_ratio
 
 def main():
     default_workers = 1
-    default_threads = CPU_COUNT
+    default_threads = min(CPU_COUNT, 24)
     TOP_K_LIST = [20, 30, 40, 50, 60, 70, 80, 90, 100]
 
     p = argparse.ArgumentParser()
@@ -342,7 +349,8 @@ def main():
     print(f" 🏎️  算力配置: LightGBM 使用 {args.threads} 线程运算")
     print(f"{'='*60}\n")
 
-    all_results = {k: [] for k in TOP_K_LIST}
+    all_results_hit5 = {k: [] for k in TOP_K_LIST}
+    all_results_hit20 = {k: [] for k in TOP_K_LIST}
     total_queries = 0
 
     for year in years:
@@ -356,12 +364,15 @@ def main():
             city_ratio=args.city_ratio
         )
 
-        hit20_at_100 = results[100]
+        hit20_at_100 = results[100]['hit20']
         hit_rate_20_in_100 = hit20_at_100 / 20.0 * 100
-        print(f"📊 [{year}] 前100结果中命中前20的命中率: {hit_rate_20_in_100:.1f}% (平均命中 {hit20_at_100:.2f}/20)")
+        hit5_at_100 = results[100]['hit5']
+        hit_rate_5_in_100 = hit5_at_100 / 5.0 * 100
+        print(f"📊 [{year}] 前100中命中Top5: {hit_rate_5_in_100:.1f}% ({hit5_at_100:.2f}/5) | 命中Top20: {hit_rate_20_in_100:.1f}% ({hit20_at_100:.2f}/20)")
 
-        for k in all_results:
-            all_results[k].append(results[k])
+        for k in TOP_K_LIST:
+            all_results_hit5[k].append(results[k]['hit5'])
+            all_results_hit20[k].append(results[k]['hit20'])
         total_queries += n_queries
 
     print(f"\n{'='*60}")
@@ -369,8 +380,9 @@ def main():
     print(f" 📋 有效参与评估的 Query 总数: {total_queries:,}")
     print(f" 📈 最终大盘综合指标 (各年均值):")
     for k in TOP_K_LIST:
-        mean_hit = np.mean(all_results[k])
-        print(f"    Mean Hit20@{k}: {mean_hit:.2f}")
+        mean_h5 = np.mean(all_results_hit5[k])
+        mean_h20 = np.mean(all_results_hit20[k])
+        print(f"    Recall@{k}: Mean Hit5={mean_h5:.2f}  Mean Hit20={mean_h20:.2f}")
     print(f"{'='*60}\n")
 
 if __name__ == '__main__':
