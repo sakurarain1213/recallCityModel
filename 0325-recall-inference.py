@@ -168,7 +168,7 @@ class FastPredictor:
         return tensor, city_map, all_ids
 
     def run_year(self, year, top_k_list=[20, 30, 40, 50, 60, 70, 80, 90, 100], sample_ratio=1.0, city_ratio=1.0, seed=42):
-        out_file = OUTPUT_DIR / f"{year}_local_sample.jsonl"
+        out_file = OUTPUT_DIR / f"{year}.jsonl"
 
         max_top_k = max(top_k_list) 
 
