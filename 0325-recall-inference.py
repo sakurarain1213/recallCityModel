@@ -11,8 +11,12 @@ import argparse
 import multiprocessing
 import concurrent.futures
 import warnings
+# 设置标准输出编码，解决Windows终端打印Emoji报错
 import sys
+import io
 from pathlib import Path
+if sys.stdout.encoding != 'utf-8':
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 from collections import defaultdict
 
 warnings.filterwarnings('ignore')
@@ -170,33 +174,62 @@ class FastPredictor:
     def run_year(self, year, top_k_list=[20, 30, 40, 50, 60, 70, 80, 90, 100], sample_ratio=1.0, city_ratio=1.0, seed=42):
         out_file = OUTPUT_DIR / f"{year}.jsonl"
 
-        max_top_k = max(top_k_list) 
+        max_top_k = max(top_k_list)
 
         print(f"[{year}] 开始读取数据...")
         tensor, city_map, valid_ids = self.load_data(year)
 
-        conn = duckdb.connect(str(self.db_path), read_only=True)
-        top_cols = ', '.join([f'To_Top{i}' for i in range(1, 21)])
-        df_gt = conn.execute(f"SELECT Type_ID, {top_cols} FROM migration_data WHERE Year = {year}").fetchdf()
-        conn.close()
-
-        pos_cities = df_gt[[f'To_Top{i}' for i in range(1, 21)]].map(parse_to_city).values
-        type_ids = df_gt['Type_ID'].values.tolist()
-
-        n_queries = len(type_ids)
-        if sample_ratio < 1.0:
-            rng = np.random.default_rng(seed + year)
-            keep_n = max(1, int(n_queries * sample_ratio))
-            keep_indices = rng.choice(n_queries, keep_n, replace=False)
-            type_ids = [type_ids[i] for i in keep_indices]
-            pos_cities = [pos_cities[i] for i in keep_indices]
-
-        gt_dict = {tid: set(pos) for tid, pos in zip(type_ids, pos_cities)}
-        gt_dict_top5 = {tid: set(pos[:5]) for tid, pos in zip(type_ids, pos_cities)}
-
         # ✅ 核心更新：使用 337 个全局城市节点作为候选池！
         global_city_pool = load_global_cities(CITY_NODES_PATH)
         print(f"[{year}] 构建标准候选城市池: 共 {len(global_city_pool)} 个核心城市")
+
+        has_gt = False
+        type_ids = []
+        pos_cities = []
+        gt_dict = {}
+        gt_dict_top5 = {}
+
+        if year <= 2020:
+            has_gt = True
+            conn = duckdb.connect(str(self.db_path), read_only=True)
+            top_cols = ', '.join([f'To_Top{i}' for i in range(1, 21)])
+            df_gt = conn.execute(f"SELECT Type_ID, {top_cols} FROM migration_data WHERE Year = {year}").fetchdf()
+            conn.close()
+
+            pos_cities = df_gt[[f'To_Top{i}' for i in range(1, 21)]].map(parse_to_city).values
+            type_ids = df_gt['Type_ID'].values.tolist()
+
+            n_queries = len(type_ids)
+            if sample_ratio < 1.0:
+                rng = np.random.default_rng(seed + year)
+                keep_n = max(1, int(n_queries * sample_ratio))
+                keep_indices = rng.choice(n_queries, keep_n, replace=False)
+                type_ids = [type_ids[i] for i in keep_indices]
+                pos_cities = [pos_cities[i] for i in keep_indices]
+
+            gt_dict = {tid: set(pos) for tid, pos in zip(type_ids, pos_cities)}
+            gt_dict_top5 = {tid: set(pos[:5]) for tid, pos in zip(type_ids, pos_cities)}
+        else:
+            # 纯推理模式：为所有城市的所有人群类型生成预测
+            # 我们构造全量 Type_ID: {gender}_{age}_{edu}_{ind}_{inc}_{fam}_{from_city}
+            type_ids = []
+            for fc in valid_ids: # 从城市出发
+                # 随机或全量，这里生成全部人群组合 (2x5x3x4x5x2 = 1200 种/城市)
+                for g in ['M', 'F']:
+                    for a in ['20', '30', '40', '55', '65']:
+                        for e in ['EduLo', 'EduMid', 'EduHi']:
+                            for i in ['Agri', 'Mfg', 'Service', 'Wht']:
+                                for inc in ['IncL', 'IncML', 'IncM', 'IncMH', 'IncH']:
+                                    for f in ['Split', 'Unit']:
+                                        type_ids.append(f"{g}_{a}_{e}_{i}_{inc}_{f}_{fc}")
+
+            # 由于纯推理查询量巨大 (约40万)，这里也支持采样
+            n_queries = len(type_ids)
+            if sample_ratio < 1.0:
+                rng = np.random.default_rng(seed + year)
+                keep_n = max(1, int(n_queries * sample_ratio))
+                keep_indices = rng.choice(n_queries, keep_n, replace=False)
+                type_ids = [type_ids[i] for i in keep_indices]
 
         fc_groups = defaultdict(list)
         for tid in type_ids:
@@ -294,30 +327,36 @@ class FastPredictor:
                 f.write(json.dumps({tid: cities[:100]}) + '\n')
         print(f"[{year}] 已保存推理结果到: {out_file}")
 
-        metrics_hit5 = {k: [] for k in top_k_list}
-        metrics_hit20 = {k: [] for k in top_k_list}
-        for i in range(len(all_pred_tids)):
-            tid = all_pred_tids[i]
-            true_set = gt_dict.get(tid, set())
-            if len(true_set) == 0:
-                continue
-            true_top5 = gt_dict_top5.get(tid, set())
-            pred_cities_k = all_pred_cities[i]
+        if has_gt:
+            metrics_hit5 = {k: [] for k in top_k_list}
+            metrics_hit20 = {k: [] for k in top_k_list}
+            for i in range(len(all_pred_tids)):
+                tid = all_pred_tids[i]
+                true_set = gt_dict.get(tid, set())
+                if len(true_set) == 0:
+                    continue
+                true_top5 = gt_dict_top5.get(tid, set())
+                pred_cities_k = all_pred_cities[i]
+                for k in top_k_list:
+                    pred_set_k = set(pred_cities_k[:k])
+                    metrics_hit5[k].append(len(pred_set_k & true_top5))
+                    metrics_hit20[k].append(len(pred_set_k & true_set))
+
+            results = {}
             for k in top_k_list:
-                pred_set_k = set(pred_cities_k[:k])
-                metrics_hit5[k].append(len(pred_set_k & true_top5))
-                metrics_hit20[k].append(len(pred_set_k & true_set))
+                results[k] = {
+                    'hit5': np.mean(metrics_hit5[k]) if metrics_hit5[k] else 0.0,
+                    'hit20': np.mean(metrics_hit20[k]) if metrics_hit20[k] else 0.0,
+                }
 
-        results = {}
-        for k in top_k_list:
-            results[k] = {
-                'hit5': np.mean(metrics_hit5[k]) if metrics_hit5[k] else 0.0,
-                'hit20': np.mean(metrics_hit20[k]) if metrics_hit20[k] else 0.0,
-            }
-
-        metrics_str = ' | '.join([f"@{k}: H5={results[k]['hit5']:.2f} H20={results[k]['hit20']:.2f}" for k in top_k_list])
-        print(f"✅ [{year}] 推理耗时: {infer_time:.1f}s | {metrics_str} (N={len(all_pred_tids):,})")
-        return year, results, len(all_pred_tids)
+            metrics_str = ' | '.join([f"@{k}: H5={results[k]['hit5']:.2f} H20={results[k]['hit20']:.2f}" for k in top_k_list])
+            print(f"✅ [{year}] 推理耗时: {infer_time:.1f}s | {metrics_str} (N={len(all_pred_tids):,})")
+            return year, results, len(all_pred_tids)
+        else:
+            print(f"✅ [{year}] 纯推理模式完成耗时: {infer_time:.1f}s (N={len(all_pred_tids):,})")
+            # 伪造空结果返回以兼容
+            empty_res = {k: {'hit5': 0.0, 'hit20': 0.0} for k in top_k_list}
+            return year, empty_res, len(all_pred_tids)
 
 def process_year(year, model_path, db_path, cache_dir, num_threads, sample_ratio, city_ratio):
     predictor = FastPredictor(model_path, db_path, cache_dir, num_threads)
@@ -368,7 +407,10 @@ def main():
         hit_rate_20_in_100 = hit20_at_100 / 20.0 * 100
         hit5_at_100 = results[100]['hit5']
         hit_rate_5_in_100 = hit5_at_100 / 5.0 * 100
-        print(f"📊 [{year}] 前100中命中Top5: {hit_rate_5_in_100:.1f}% ({hit5_at_100:.2f}/5) | 命中Top20: {hit_rate_20_in_100:.1f}% ({hit20_at_100:.2f}/20)")
+        if year <= 2020:
+            print(f"📊 [{year}] 前100中命中Top5: {hit_rate_5_in_100:.1f}% ({hit5_at_100:.2f}/5) | 命中Top20: {hit_rate_20_in_100:.1f}% ({hit20_at_100:.2f}/20)")
+        else:
+            print(f"📊 [{year}] 纯推理模式不计算命中率")
 
         for k in TOP_K_LIST:
             all_results_hit5[k].append(results[k]['hit5'])
@@ -377,12 +419,15 @@ def main():
 
     print(f"\n{'='*60}")
     print(f" 🎯 二分类召回任务圆满结束: 指标统计聚合完毕")
-    print(f" 📋 有效参与评估的 Query 总数: {total_queries:,}")
-    print(f" 📈 最终大盘综合指标 (各年均值):")
-    for k in TOP_K_LIST:
-        mean_h5 = np.mean(all_results_hit5[k])
-        mean_h20 = np.mean(all_results_hit20[k])
-        print(f"    Recall@{k}: Mean Hit5={mean_h5:.2f}  Mean Hit20={mean_h20:.2f}")
+    print(f" 📋 有效参与评估/推理的 Query 总数: {total_queries:,}")
+    if any(y <= 2020 for y in years):
+        print(f" 📈 最终大盘综合指标 (基于 <=2020 的有GT数据部分各年均值):")
+        for k in TOP_K_LIST:
+            mean_h5 = np.mean(all_results_hit5[k])
+            mean_h20 = np.mean(all_results_hit20[k])
+            print(f"    Recall@{k}: Mean Hit5={mean_h5:.2f}  Mean Hit20={mean_h20:.2f}")
+    else:
+        print(" 🚀 纯推理运行，无大盘指标。")
     print(f"{'='*60}\n")
 
 if __name__ == '__main__':
